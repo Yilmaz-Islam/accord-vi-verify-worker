@@ -1,0 +1,19 @@
+{
+  "name": "accord-vi-verify",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+  "account_id": "c77367b0fe0a65a2cc7ba7a2f26bde0f",
+  "kv_namespaces": [
+    {
+      "binding": "CODES",
+      "id": "7d31167ed85b4e8695aef6476c1fad9a"
+    }
+  ],
+  "vars": {
+    "EMAILJS_PUBLIC_KEY": "YqynHAMUMXnqxoAEx",
+    "EMAILJS_SERVICE_ID": "service_xnysqdr",
+    "EMAILJS_NOTIFY_TEMPLATE_ID": "template_ylqze4n",
+    "EMAILJS_CODE_TEMPLATE_ID": "template_fvwx0sa",
+    "ALLOWED_ORIGINS": "http://localhost:5500,https://yilmaz-islam.github.io"
+  }
+}
