@@ -20,13 +20,8 @@ function corsHeaders(origin, env) {
   return {
     'Access-Control-Allow-Origin': allow,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    // The admin session lives in an HttpOnly cookie, which only crosses
-    // origins (github.io -> workers.dev) if both sides opt in: the
-    // response needs this header (never '*' alongside it — the origin
-    // above is always one specific allowed origin, never a wildcard),
-    // and every admin fetch on the page side must pass credentials:'include'.
-    'Access-Control-Allow-Credentials': 'true',
+    // Authorization carries the admin bearer token (see below).
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   };
 }
 
@@ -73,12 +68,20 @@ async function sendEmail(env, templateId, params) {
   }
 }
 
-// ---------- Admin session: a signed, expiring cookie ----------
-// No session store — the cookie itself carries an expiry plus an HMAC
+// ---------- Admin session: a signed, expiring bearer token ----------
+// No session store — the token itself carries an expiry plus an HMAC
 // over that expiry, keyed on the admin password. Valid until it expires
 // or the password is rotated (which invalidates every outstanding
 // session at once, by design). Web Crypto (crypto.subtle) is available
 // natively in the Workers runtime, no extra dependency.
+//
+// This is a bearer token in localStorage, not a cookie: the admin page
+// (github.io) and this worker (workers.dev) are different sites, and
+// browsers that block third-party cookies (Safari by default, and a
+// growing number of others) silently refuse to persist a cookie set
+// from a cross-site fetch response — which broke sign-in for exactly
+// those visitors under the old cookie-based version. A bearer token
+// sent via the Authorization header isn't subject to that policy at all.
 async function hmacSign(secret, message) {
   const key = await crypto.subtle.importKey(
     'raw',
@@ -113,18 +116,9 @@ async function verifySessionToken(env, token) {
   return expected === sig;
 }
 
-function getCookie(request, name) {
-  const header = request.headers.get('Cookie') || '';
-  const match = header.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function sessionCookieHeader(token, maxAgeSeconds) {
-  // SameSite=None + Secure: the admin page (github.io) and this worker
-  // (workers.dev) are different sites, so the cookie needs both to ride
-  // along on a cross-site fetch at all. HttpOnly keeps it unreadable to
-  // any page JS, including this site's own (defence against XSS).
-  return `admin_session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=${maxAgeSeconds}`;
+function bearerToken(request) {
+  const header = request.headers.get('Authorization') || '';
+  return header.startsWith('Bearer ') ? header.slice(7) : '';
 }
 
 export default {
@@ -270,18 +264,17 @@ export default {
       }
 
       const token = await makeSessionToken(env);
-      return json({ ok: true }, 200, {
-        ...cors,
-        'Set-Cookie': sessionCookieHeader(token, SESSION_TTL_MS / 1000),
-      });
+      return json({ ok: true, token }, 200, cors);
     }
 
     if (url.pathname === '/admin/logout') {
-      return json({ ok: true }, 200, { ...cors, 'Set-Cookie': sessionCookieHeader('', 0) });
+      // Stateless token: there's nothing to revoke server-side, this
+      // just gives the client a symmetrical endpoint to call.
+      return json({ ok: true }, 200, cors);
     }
 
     if (url.pathname === '/admin/registrations') {
-      const valid = await verifySessionToken(env, getCookie(request, 'admin_session'));
+      const valid = await verifySessionToken(env, bearerToken(request));
       if (!valid) {
         return json({ ok: false, error: 'Not signed in' }, 401, cors);
       }
