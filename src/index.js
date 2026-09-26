@@ -256,7 +256,10 @@ export default {
     // ---------- Admin portal: password login + registration log ----------
     if (url.pathname === '/admin/login') {
       const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-      const ipOk = await checkRateLimit(env, `rl:admin-login:${ip}`, 8, 600);
+      // 20/10min: generous enough that a human mistyping a password (or
+      // several execs sharing one campus IP) won't get locked out, while
+      // still capping a brute-force guesser at ~2 attempts/minute.
+      const ipOk = await checkRateLimit(env, `rl:admin-login:${ip}`, 20, 600);
       if (!ipOk) {
         return json({ ok: false, error: 'Too many attempts — please wait a few minutes and try again' }, 429, cors);
       }
