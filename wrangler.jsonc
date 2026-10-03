@@ -9,6 +9,13 @@
       "id": "7d31167ed85b4e8695aef6476c1fad9a"
     }
   ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "accord-accounts",
+      "database_id": "18fb0046-f3e4-4529-971d-d3a4a8b8e55d"
+    }
+  ],
   "vars": {
     "EMAILJS_PUBLIC_KEY": "YqynHAMUMXnqxoAEx",
     "EMAILJS_SERVICE_ID": "service_xnysqdr",

@@ -1,0 +1,19 @@
+{
+  // LOCAL TESTING ONLY. Not used by production (production reads wrangler.jsonc).
+  // `wrangler dev --config wrangler.local.jsonc` runs everything in a local
+  // simulator: a local SQLite for D1 and a local KV, so nothing here touches
+  // your real Cloudflare account. Secrets come from .dev.vars (git-ignored).
+  "name": "accord-vi-verify-local",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+  "kv_namespaces": [{ "binding": "CODES", "id": "local-codes" }],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "accord-accounts", "database_id": "local-accounts" }
+  ],
+  "vars": {
+    "ALLOWED_ORIGINS": "http://localhost:5500,http://localhost:4501,https://yilmaz-islam.github.io",
+    // DEV_MODE returns email codes in the response instead of emailing them.
+    // It must NEVER appear in wrangler.jsonc (production).
+    "DEV_MODE": "1"
+  }
+}

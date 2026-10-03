@@ -14,6 +14,8 @@
 // (EmailJS's free plan caps templates at 2, and the organizer-notification
 // template already uses one of them).
 
+import { handleAccount, handleAdminTickets, emailHtml } from './accounts.js';
+
 function corsHeaders(origin, env) {
   const allowed = env.ALLOWED_ORIGINS.split(',').map((s) => s.trim());
   const allow = allowed.includes(origin) ? origin : allowed[0];
@@ -169,11 +171,19 @@ export default {
       );
 
       try {
+        // `subject` and `message` feed the shared one-template setup (see
+        // ACCOUNTS.md); `form_type` and `code` keep the older template working.
+        const codeMessage =
+          `Hi ${name},\n\nYour ${env.SITE_NAME || 'Accord VI'} code for "${form_type}" is ${code}. ` +
+          'It expires in 10 minutes. If you did not ask for this, you can ignore this email.';
         await sendEmail(env, env.EMAILJS_CODE_TEMPLATE_ID, {
           name,
           email,
           form_type,
           code,
+          subject: `${env.SITE_NAME || 'Accord VI'}: your verification code`,
+          message: codeMessage,
+          html: emailHtml(env, codeMessage),
         });
       } catch (err) {
         console.log('sendEmail (code) failed:', err.message);
@@ -288,6 +298,21 @@ export default {
       );
       registrations.reverse(); // most recent first
       return json({ ok: true, registrations: registrations.filter(Boolean) }, 200, cors);
+    }
+
+    // ---------- User accounts and tickets (see accounts.js) ----------
+    if (url.pathname.startsWith('/account/')) {
+      return handleAccount({ request, env, url, body, cors, json, checkRateLimit, sendEmail });
+    }
+    if (['/admin/tickets', '/admin/ticket-receipt', '/admin/ticket-confirm'].includes(url.pathname)) {
+      const isAdmin = (req) => verifySessionToken(env, bearerToken(req));
+      return handleAdminTickets({ request, env, url, body, cors, json, sendEmail, isAdmin });
+    }
+
+    // Local testing only: shows the emails the worker would have sent.
+    if (url.pathname === '/dev/outbox' && env.DEV_MODE === '1') {
+      const raw = await env.CODES.get('dev:outbox');
+      return json({ ok: true, outbox: raw ? JSON.parse(raw) : [] }, 200, cors);
     }
 
     return json({ ok: false, error: 'Not found' }, 404, cors);
