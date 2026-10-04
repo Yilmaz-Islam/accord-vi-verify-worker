@@ -28,7 +28,7 @@ A ticket code is `A6.<random id>.<signature>`. The signature is an HMAC made wit
 server has, so nobody (including an AI) can invent a code that passes. The server also records the first admit, so a copied
 or screenshotted ticket works at most once. A QR code *can* be photographed and shared, so the real protections are the
 single use and the name/ID check at the gate. The gate staff's own password (`GATE_PASSWORD`) lets them scan and admit only:
-they cannot see receipts or registration lists.
+they cannot see receipts or registration lists. Admins do not need it: the scanner page also signs in with the admin password, or reuses an admin who is already signed in, so if everyone at the gate is an admin the gate password can simply be left unused (or removed with `npx wrangler secret delete GATE_PASSWORD`).
 
 ## Run and test locally
 
