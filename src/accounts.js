@@ -631,6 +631,12 @@ async function hmacB64(secret, message) {
 
 const newTicketId = () => b64u(crypto.getRandomValues(new Uint8Array(12)));
 
+// A short reference the holder can read aloud and the gate can compare, e.g. "7F3K-Q2XA". It is just
+// the first characters of the ticket id for display; it is not a credential (the signed code is).
+function ticketRef(id) {
+  const s = String(id || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8);
+  return s.length === 8 ? `${s.slice(0, 4)}-${s.slice(4)}` : s;
+}
 async function ticketCode(env, id) {
   const sig = (await hmacB64(env.TICKET_SECRET, `ticket:${id}`)).slice(0, 22);
   return `A6.${id}.${sig}`;
@@ -699,19 +705,39 @@ export async function handleGate(ctx) {
   if (!env.DB || !env.TICKET_SECRET) return fail('Tickets are not configured on this server', 503);
 
   const baseSelect = `SELECT a.id, a.seq, a.holder_name AS holderName, a.admitted_at AS admittedAt,
-                             t.attendee_count AS count, t.pass, t.persona, u.name AS purchaser
+                             t.id AS registrationId, t.attendee_count AS count, t.pass, t.persona,
+                             t.pay_method AS payMethod, t.confirmed_at AS confirmedAt,
+                             u.name AS purchaser, u.email AS purchaserEmail
                         FROM attendee_tickets a
                         JOIN tickets t ON t.id = a.ticket_id
                         JOIN users u ON u.id = t.user_id`;
+  // Everything door staff can use to check that the person in front of them is the person the
+  // ticket was made for. The email is masked: enough to ask "does yours start with ma?", not
+  // enough to read out in full.
   const shape = (r) => ({
     id: r.id,
+    ref: ticketRef(r.id),
     holderName: r.holderName,
     seq: r.seq,
     of: r.count,
     pass: r.pass,
+    persona: r.persona,
+    payMethod: r.payMethod,
+    confirmedAt: r.confirmedAt || null,
     purchaser: r.purchaser,
+    purchaserEmail: r.purchaserEmail ? maskEmail(r.purchaserEmail) : '',
     admittedAt: r.admittedAt || null,
   });
+  // The rest of the party, for a group: who else is on the same registration and whether they are in.
+  const withParty = async (r) => {
+    const base = shape(r);
+    if (!(r.count > 1)) return base;
+    const { results } = await env.DB.prepare(
+      'SELECT seq, holder_name AS holderName, admitted_at AS admittedAt FROM attendee_tickets WHERE ticket_id = ? ORDER BY seq'
+    ).bind(r.registrationId).all();
+    base.party = results.map((p) => ({ seq: p.seq, holderName: p.holderName, admittedAt: p.admittedAt || null, you: p.seq === r.seq }));
+    return base;
+  };
 
   // Public: what a ticket page needs to show (only holds for a genuine code).
   if (url.pathname === '/ticket/info') {
@@ -720,7 +746,7 @@ export async function handleGate(ctx) {
     if (!id) return fail('This ticket code is not valid', 404);
     const r = await env.DB.prepare(`${baseSelect} WHERE a.id = ?`).bind(id).first();
     if (!r) return fail('This ticket code is not valid', 404);
-    return ok({ ticket: { holderName: r.holderName, seq: r.seq, of: r.count, pass: r.pass, used: !!r.admittedAt } });
+    return ok({ ticket: { ref: ticketRef(r.id), holderName: r.holderName, seq: r.seq, of: r.count, pass: r.pass, used: !!r.admittedAt } });
   }
 
   if (url.pathname === '/gate/login') {
@@ -737,11 +763,12 @@ export async function handleGate(ctx) {
   if (!((await verifyGateToken(env, bearer)) || (await isAdmin(request)))) return fail('Not signed in', 401);
 
   if (url.pathname === '/gate/lookup') {
-    const id = await ticketIdFromCode(env, body.code);
+    // A scanned code, or the id of a name-search result (search results are slim; this fills in the rest).
+    const id = body.code ? await ticketIdFromCode(env, body.code) : body.id ? String(body.id) : null;
     if (!id) return json({ ok: true, valid: false, reason: 'not-genuine' }, 200, cors);
     const r = await env.DB.prepare(`${baseSelect} WHERE a.id = ?`).bind(id).first();
     if (!r) return json({ ok: true, valid: false, reason: 'unknown' }, 200, cors);
-    return ok({ valid: true, ticket: shape(r) });
+    return ok({ valid: true, ticket: await withParty(r) });
   }
 
   if (url.pathname === '/gate/search') {
@@ -751,7 +778,8 @@ export async function handleGate(ctx) {
     const { results } = await env.DB.prepare(
       `${baseSelect} WHERE a.holder_name LIKE ? ESCAPE '\\' OR u.name LIKE ? ESCAPE '\\' ORDER BY a.holder_name LIMIT 15`
     ).bind(like, like).all();
-    return ok({ matches: results.map(shape) });
+    // A list stays slim: no email, not even masked. Tapping a result looks the ticket up in full.
+    return ok({ matches: results.map((r) => { const s = shape(r); delete s.purchaserEmail; return s; }) });
   }
 
   if (url.pathname === '/gate/admit') {
@@ -766,7 +794,7 @@ export async function handleGate(ctx) {
       .run();
     const r = await env.DB.prepare(`${baseSelect} WHERE a.id = ?`).bind(id).first();
     if (!r) return fail('Ticket not found', 404);
-    return ok({ admitted: res.meta.changes === 1, ticket: shape(r) });
+    return ok({ admitted: res.meta.changes === 1, ticket: await withParty(r) });
   }
 
   return fail('Not found', 404);
@@ -788,7 +816,8 @@ export async function handleAdminTickets(ctx) {
               t.hear_about AS hearAbout, t.sponsor_tier AS sponsorTier,
               t.submitted_at AS submittedAt, t.confirmed_at AS confirmedAt,
               (t.receipt IS NOT NULL) AS hasReceipt,
-              (SELECT COUNT(*) FROM receipt_history h WHERE h.ticket_id = t.id) AS receiptCount
+              (SELECT COUNT(*) FROM receipt_history h WHERE h.ticket_id = t.id) AS receiptCount,
+              (SELECT COUNT(*) FROM attendee_tickets a WHERE a.ticket_id = t.id AND a.admitted_at IS NOT NULL) AS admittedCount
          FROM tickets t JOIN users u ON u.id = t.user_id
         ORDER BY (t.status = 'pending') DESC, t.submitted_at DESC`
     ).all();
@@ -1316,6 +1345,7 @@ export async function handleAccount(ctx) {
         seq: tk.seq,
         of: list.length,
         holderName: tk.holderName,
+        ref: ticketRef(tk.id),
         code: tk.code,
         used: !!used.get(tk.id),
       })),

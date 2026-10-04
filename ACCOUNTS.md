@@ -72,12 +72,18 @@ email codes in the response and keeps outgoing emails in `/dev/outbox`. **Never 
 | `/account/tickets` | - | Bearer | the person's QR tickets (only after the payment is confirmed) |
 | `/account/password/forgot` / `reset` | email / email, code, newPassword | none | emailed code, then new password; signs out every device |
 | `/account/delete` | password | Bearer | deletes everything about them and emails them (refused once a payment is confirmed) |
-| `/admin/tickets` | - | admin | every registration, without images |
+| `/admin/tickets` | - | admin | every registration, without images (with `admittedCount`: how many of its people have entered the gate) |
 | `/admin/ticket-receipt` / `ticket-history` | id | admin | the current receipt / the replaced ones |
 | `/admin/ticket-confirm` | id | admin | confirms, creates the tickets, emails the buyer |
-| `/ticket/info` | code | none (needs a genuine code) | what a ticket page shows: holder, pass, used or not |
+| `/ticket/info` | code | none (needs a genuine code) | what a ticket page shows: holder, short `ref`, pass, used or not (never an email) |
 | `/gate/login` | password | none | a gate token (12 hours) |
-| `/gate/lookup` / `search` / `admit` | code or q or id | gate or admin | show a ticket / find by name / admit (once) |
+| `/gate/lookup` / `search` / `admit` | code or q or id | gate or admin | show a ticket / find by name / admit (once). `lookup` also takes an `id` (what a name-search tap sends) |
+
+What a gate scan returns, so door staff can check the person against the ticket: the holder's name, a short `ref`
+(e.g. `A0VR-7DNN`, also shown on the holder's ticket page), pass, which ticket it is (`seq` of `of`), the type of
+registration, how it was paid, when the payment was confirmed, who bought it and their **masked** email
+(`g••••••@example.com`), when it was admitted if it was, and, for a group, a `party` list of everyone on the booking
+with who is already in. Search results stay slim (no email, no party); the full detail comes from `lookup`.
 
 ## EmailJS: one template for every email to a person
 
@@ -119,6 +125,13 @@ catches up after the laptop was off. Check `backup.log` in that folder. To resto
 `npx wrangler d1 execute accord-accounts --remote --file <folder>\accord-accounts.sql`.
 Backups hold personal details and receipts: keep them off shared drives. Cloudflare D1 also keeps its own recent history
 (Time Travel), which is a second safety net but not a substitute for these.
+
+## Starting again from nothing (testing)
+
+`scripts/reset-test-data.ps1` erases every account, registration, receipt and ticket (the tables and secrets stay;
+the older KV registration log is not touched). It shows the counts, takes a backup first, and asks you to type
+`RESET` before it deletes anything. `-Local` does the same to the local test database. It is permanent: the backup
+is the only way back. Never run it once real people have registered and paid.
 
 ## Security notes
 

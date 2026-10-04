@@ -127,6 +127,21 @@ check('a forged code shows as not genuine', r.status === 200 && r.data.valid ===
 r = await call('/gate/lookup', { code: 'hello' }, gateToken);
 check('nonsense shows as not genuine', r.data.valid === false, r.data);
 
+console.log('identity details on a scan');
+r = await call('/gate/lookup', { code: groupTickets[0].code }, gateToken);
+const idt = r.data.ticket;
+check('a scan carries a short reference, the type of registration and how it was paid', /^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(idt.ref) && idt.persona === 'group' && ['jazzcash', 'bank', 'cash'].includes(idt.payMethod), idt);
+check('a scan carries when the payment was confirmed', !!idt.confirmedAt && !Number.isNaN(Date.parse(idt.confirmedAt)), idt.confirmedAt);
+check("the buyer's email is masked, never in full", /^[^@]+@[^@]+$/.test(idt.purchaserEmail) && idt.purchaserEmail.includes('•') && idt.purchaserEmail[0] === lead.email[0] && idt.purchaserEmail !== lead.email && idt.purchaserEmail.split('@')[1] === lead.email.split('@')[1], idt.purchaserEmail);
+check('a group scan lists the whole party and marks which one this is', Array.isArray(idt.party) && idt.party.length === 3 && idt.party.filter((p) => p.you).length === 1 && idt.party.find((p) => p.you).seq === 1 && idt.party[0].holderName === ALI, idt.party);
+check('the party shows who is already in', idt.party.every((p) => p.admittedAt === null));
+r = await call('/gate/lookup', { id: idt.id }, gateToken);
+check('a ticket can also be looked up by id (what a name-search tap does)', r.data.valid === true && r.data.ticket.holderName === ALI && r.data.ticket.party.length === 3, r.data);
+r = await call('/gate/lookup', { id: 'nope' + 'x'.repeat(12) }, gateToken);
+check('an unknown id shows as not found, not as an error', r.status === 200 && r.data.valid === false, r.data);
+r = await call('/gate/lookup', { id: idt.id });
+check('looking up by id still needs the gate or admin token', r.status === 401, r.status);
+
 r = await call('/gate/admit', { code: groupTickets[0].code }, gateToken);
 check('the first admit lets the person in', r.status === 200 && r.data.admitted === true && !!r.data.ticket.admittedAt, r.data);
 const [again1, again2] = await Promise.all([
@@ -138,6 +153,12 @@ r = await call('/gate/lookup', { code: groupTickets[0].code }, gateToken);
 check('a used ticket shows when it was used', !!r.data.ticket.admittedAt);
 r = await call('/ticket/info', { code: groupTickets[0].code });
 check('the public ticket page now says used', r.data.ticket.used === true, r.data);
+check('the public ticket page shows the short reference but no email', /^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(r.data.ticket.ref) && r.data.ticket.ref === idt.ref && !JSON.stringify(r.data).includes('@'), r.data);
+r = await call('/gate/lookup', { code: groupTickets[0].code }, gateToken);
+check('after the admit the party shows that one as in and the others not', r.data.ticket.party.find((p) => p.seq === 1).admittedAt && !r.data.ticket.party.find((p) => p.seq === 2).admittedAt, r.data.ticket.party);
+const listNow = (await call('/admin/tickets', {}, adminToken)).data.tickets;
+const leadRow = listNow.find((t) => t.email === lead.email);
+check('the admin list counts how many of a registration are in', leadRow.admittedCount === 1 && leadRow.attendeeCount === 3, leadRow);
 r = await call('/account/tickets', {}, lead.token);
 check("the buyer's list shows which tickets are used", r.data.tickets[0].used === true && r.data.tickets[1].used === false, r.data.tickets.map((t) => t.used));
 
