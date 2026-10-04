@@ -10,6 +10,10 @@ const fromDev = (k) => (devVars.match(new RegExp(`^${k}=(.*)$`, 'm')) || [])[1] 
 const ADMIN_PW = process.env.ADMIN_PW || fromDev('ADMIN_PASSWORD');
 const GATE_PW = process.env.GATE_PW || fromDev('GATE_PASSWORD');
 const stamp = Date.now();
+// Names are unique per run, so leftovers from earlier runs in the same local database cannot interfere.
+const TAG = String(stamp).slice(-6);
+const ALI = `Ali Raza ${TAG}`;
+const SANA = `Sana Tariq ${TAG}`;
 const TEST_IP = `10.${(stamp >> 8) & 255}.${(stamp >> 4) & 255}.${(stamp & 255) ^ 77}`;
 const RECEIPT_A = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
 const RECEIPT_B = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -41,7 +45,7 @@ async function call(path, body, token) {
 
 async function newUser(prefix, name, password) {
   const email = `${prefix}+${stamp}@example.com`;
-  let r = await call('/account/signup/request', { name, email, password });
+  let r = await call('/account/signup/request', { name, email, password, acceptTerms: true });
   r = await call('/account/signup/verify', { email, code: r.data.devCode });
   return { email, name, token: r.data.token };
 }
@@ -71,12 +75,12 @@ check('tickets need a signed-in account', r.status === 401, r.status);
 
 console.log('group tickets');
 const lead = await newUser('lead', 'Group Leader', 'violet-moose-harbor');
-await call('/account/ticket/submit', { persona: 'group', pass: 'concert', attendeeCount: 3, groupNames: 'Ali Raza\nSana Tariq', payMethod: 'bank', receipt: RECEIPT_A }, lead.token);
+await call('/account/ticket/submit', { persona: 'group', pass: 'concert', attendeeCount: 3, groupNames: `${ALI}\n${SANA}`, payMethod: 'bank', receipt: RECEIPT_A }, lead.token);
 await confirmFor(lead.email);
 r = await call('/account/tickets', {}, lead.token);
 const names = r.data.tickets.map((t) => t.holderName);
 check('a group of 3 gets 3 separate tickets', r.data.tickets.length === 3, names);
-check('named from the typed list, then "Guest 3"', names[0] === 'Ali Raza' && names[1] === 'Sana Tariq' && /^Guest 3/.test(names[2]), names);
+check('named from the typed list, then "Guest 3"', names[0] === ALI && names[1] === SANA && /^Guest 3/.test(names[2]), names);
 check('every ticket has a different code', new Set(r.data.tickets.map((t) => t.code)).size === 3);
 const groupTickets = r.data.tickets;
 
@@ -84,11 +88,11 @@ console.log('confirmation email carries the tickets');
 let o = await call('/dev/outbox', {});
 const mail = o.data.outbox.filter((m) => m.kind === 'user' && m.to === lead.email && /payment is confirmed/i.test(m.subject)).at(-1) || {};
 check('the plain text lists a ticket link per person', (mail.message || '').split('ticket.html#A6.').length - 1 === 3, (mail.message || '').slice(0, 400));
-check('the HTML has a button per person', /Ticket 1: Ali Raza/.test(mail.html || '') && /Ticket 2: Sana Tariq/.test(mail.html || '') && /ticket\.html#A6\./.test(mail.html || ''));
+check('the HTML has a button per person', (mail.html || '').includes(`Ticket 1: ${ALI}`) && (mail.html || '').includes(`Ticket 2: ${SANA}`) && /ticket\.html#A6\./.test(mail.html || ''));
 
 console.log('public ticket page');
 r = await call('/ticket/info', { code: groupTickets[1].code });
-check('a genuine code shows the holder and pass', r.status === 200 && r.data.ticket.holderName === 'Sana Tariq' && r.data.ticket.seq === 2 && r.data.ticket.of === 3 && r.data.ticket.used === false, r.data);
+check('a genuine code shows the holder and pass', r.status === 200 && r.data.ticket.holderName === SANA && r.data.ticket.seq === 2 && r.data.ticket.of === 3 && r.data.ticket.used === false, r.data);
 const tampered = groupTickets[1].code.slice(0, -1) + (groupTickets[1].code.endsWith('A') ? 'B' : 'A');
 r = await call('/ticket/info', { code: tampered });
 check('a code with one character changed is refused', r.status === 404, r.status);
@@ -115,7 +119,7 @@ check('an admin token can also use the gate', r.status === 200 && r.data.valid =
 
 console.log('scanning and admitting');
 r = await call('/gate/lookup', { code: groupTickets[0].code }, gateToken);
-check('lookup shows holder, "1 of 3", pass and purchaser, and does not admit yet', r.data.valid && r.data.ticket.holderName === 'Ali Raza' && r.data.ticket.seq === 1 && r.data.ticket.of === 3 && r.data.ticket.purchaser === 'Group Leader' && r.data.ticket.admittedAt === null, r.data);
+check('lookup shows holder, "1 of 3", pass and purchaser, and does not admit yet', r.data.valid && r.data.ticket.holderName === ALI && r.data.ticket.seq === 1 && r.data.ticket.of === 3 && r.data.ticket.purchaser === 'Group Leader' && r.data.ticket.admittedAt === null, r.data);
 r = await call('/gate/lookup', { code: groupTickets[0].code }, gateToken);
 check('looking again changes nothing', r.data.ticket.admittedAt === null);
 r = await call('/gate/lookup', { code: 'A6.' + 'q'.repeat(16) + '.' + 'z'.repeat(22) }, gateToken);
@@ -138,18 +142,18 @@ r = await call('/account/tickets', {}, lead.token);
 check("the buyer's list shows which tickets are used", r.data.tickets[0].used === true && r.data.tickets[1].used === false, r.data.tickets.map((t) => t.used));
 
 console.log('name search at the gate');
-r = await call('/gate/search', { q: 'sana' }, gateToken);
-const sana = (r.data.matches || []).find((m) => m.holderName === 'Sana Tariq');
+r = await call('/gate/search', { q: SANA.toLowerCase() }, gateToken);
+const sana = (r.data.matches || []).find((m) => m.holderName === SANA);
 check('searching a name finds the ticket (case-insensitive)', !!sana && sana.of === 3 && sana.admittedAt === null, r.data);
 check('search results do not include codes or emails', !JSON.stringify(r.data).includes('A6.') && !JSON.stringify(r.data).includes('@'));
 r = await call('/gate/search', { q: 'a' }, gateToken);
 check('a one-letter search returns nothing', r.data.matches.length === 0, r.data);
 r = await call('/gate/search', { q: '%' }, gateToken);
 check('wildcard characters are not treated as wildcards', r.status === 200 && r.data.matches.length === 0, r.data);
-r = await call('/gate/search', { q: 'sana' });
+r = await call('/gate/search', { q: SANA.toLowerCase() });
 check('searching needs the gate or admin token', r.status === 401, r.status);
 r = await call('/gate/admit', { id: sana.id }, gateToken);
-check('admitting from a search result works', r.data.admitted === true && r.data.ticket.holderName === 'Sana Tariq', r.data);
+check('admitting from a search result works', r.data.admitted === true && r.data.ticket.holderName === SANA, r.data);
 
 console.log('receipt history (one registration per account, nothing lost)');
 const redo = await newUser('redo', 'Receipt Redo', 'silver-lynx-valley');

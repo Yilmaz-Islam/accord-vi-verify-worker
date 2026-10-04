@@ -9,7 +9,11 @@ CREATE TABLE IF NOT EXISTS users (
   pw_hash           TEXT    NOT NULL,                        -- v1$<iterations>$<salt>$<hash>, peppered PBKDF2-SHA256
   created_at        TEXT    NOT NULL,
   email_verified_at TEXT    NOT NULL,
-  pw_changed_at     TEXT
+  pw_changed_at     TEXT,
+  login_alerts      INTEGER NOT NULL DEFAULT 0,                      -- email me when a new device signs in
+  avatar_color      TEXT,                                            -- one of the colours the account page offers
+  terms_accepted_at TEXT,                                            -- when they ticked "I agree" at sign-up (NULL for accounts made before this existed)
+  terms_version     TEXT                                             -- which version of the Terms + Privacy Policy that was
 );
 
 -- Only a SHA-256 of the session token is stored, never the token itself, so a
@@ -18,7 +22,19 @@ CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT    PRIMARY KEY,
   user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL,
+  user_agent TEXT,                                -- shown in "where you are logged in"
+  country    TEXT,
+  last_seen  INTEGER
+);
+
+-- Browser + system + country combinations that have signed in before, so a genuinely new
+-- one can trigger a "new sign-in" email (only for people who turned alerts on).
+CREATE TABLE IF NOT EXISTS known_devices (
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  device_hash TEXT    NOT NULL,
+  first_seen  TEXT    NOT NULL,
+  PRIMARY KEY (user_id, device_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user    ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);

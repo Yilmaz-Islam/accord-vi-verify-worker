@@ -7,7 +7,10 @@ Code is in `src/accounts.js`, the database in `schema.sql`.
 ## The flow
 
 1. Anyone can browse the whole site. **Register** asks for an account first (a popup with a Sign up button).
-2. Signing up emails a 6-digit code once; after that the register wizard already knows the name and email.
+2. Creating an account first shows a popup with a short summary of the Terms and the Privacy Policy (and links to both). The
+   person must tick "I have read and agree" before the code is sent; the server refuses the request unless `acceptTerms` is
+   literally `true`, and stores the time they ticked and the version (`TERMS_VERSION` in `src/accounts.js`) on their account.
+   Signing up then emails a 6-digit code once; after that the register wizard already knows the name and email.
 3. The wizard collects who they are, the pass (Concert only Rs 2,500, Both nights Rs 3,500, times the group size),
    and how they pay. JazzCash and bank transfer need a clear receipt photo. Cash does not. Sponsors register interest only.
 4. Submitting saves a **pending** registration and sends a "pending payment verification" email to the person and a notice
@@ -36,10 +39,14 @@ they cannot see receipts or registration lists. Admins do not need it: the scann
 npm install
 npx wrangler d1 execute accord-accounts --local --config wrangler.local.jsonc --file schema.sql
 npx wrangler dev --config wrangler.local.jsonc --port 8787
-node test-accounts.mjs      # 32 checks: sign-up, login, sessions, reset, delete, deletion email
+node test-accounts.mjs      # 40 checks: sign-up, terms acceptance, login, sessions, reset, delete, deletion email
 node test-tickets.mjs       # 29 checks: pricing, receipts, admin review, confirmation, email safety
 node test-gate.mjs          # 44 checks: tickets, forged codes, gate access, one-time admit, receipt history
+node test-settings.mjs      # 66 checks: devices, password and email change, alerts, avatar, data download
 ```
+
+A database created before the account centre needs the one-time upgrades in `migrations/` (`002-account-settings.sql`, then
+`003-terms-acceptance.sql`); a brand-new database gets everything from `schema.sql`.
 
 Local runs use a simulated D1 and KV. `.dev.vars` (git-ignored) holds `PEPPER`, `ADMIN_PASSWORD`, `TICKET_SECRET` and
 `GATE_PASSWORD` for local testing; restart `wrangler dev` after changing it. `DEV_MODE=1` in `wrangler.local.jsonc` returns
@@ -49,12 +56,18 @@ email codes in the response and keeps outgoing emails in `/dev/outbox`. **Never 
 
 | Route | Body | Auth | Result |
 | --- | --- | --- | --- |
-| `/account/signup/request` | name, email, password | none | emails a 6-digit code |
-| `/account/signup/verify` | email, code | none | creates the account, returns `token` and `user` |
+| `/account/signup/request` | name, email, password, `acceptTerms: true` | none | emails a 6-digit code (400 without `acceptTerms`) |
+| `/account/signup/verify` | email, code | none | creates the account (with the acceptance time and version), returns `token` and `user` |
 | `/account/login` | email, password | none | `token` and `user` |
 | `/account/logout` | - | Bearer | deletes this session |
 | `/account/me` | - | Bearer | `user` and `ticket` (the registration, or null) |
 | `/account/update` | name | Bearer | updates the profile |
+| `/account/password/change` | current, next | Bearer | re-checks the password, signs out every other device, emails a notice |
+| `/account/email/change/request` / `verify` | newEmail, password / code | Bearer | code goes to the NEW address; on success the OLD address is told |
+| `/account/sessions` | - | Bearer | the signed-in devices (browser, system, country, last active) |
+| `/account/sessions/revoke` / `revoke-others` | id (from `/account/sessions`) / - | Bearer | sign one device out / every device but this one |
+| `/account/prefs` | loginAlerts, avatarColor | Bearer | sign-in alert email on or off; avatar colour |
+| `/account/export` | - | Bearer | a JSON copy of everything held about the person (never the password) |
 | `/account/ticket/submit` | persona, pass, payMethod, receipt, ... | Bearer | saves a pending registration, archives a replaced receipt, sends the emails |
 | `/account/tickets` | - | Bearer | the person's QR tickets (only after the payment is confirmed) |
 | `/account/password/forgot` / `reset` | email / email, code, newPassword | none | emailed code, then new password; signs out every device |
@@ -90,6 +103,8 @@ Keep a copy of `PEPPER` and `TICKET_SECRET` somewhere safe. Never commit any of 
 ## Deploying changes
 
 1. `npx wrangler d1 execute accord-accounts --remote --file schema.sql` (safe to repeat: every statement is `IF NOT EXISTS`).
+   If the live database predates a feature, also run each file in `migrations/` that it has not had yet, **once**, before
+   deploying the worker (the new code selects the new columns, so deploying first would break sign-in).
 2. Set any new secret (see the table).
 3. `npx wrangler deploy`
 4. Push the site pages (this redeploys the live site).
@@ -111,6 +126,12 @@ Backups hold personal details and receipts: keep them off shared drives. Cloudfl
   recommends 600,000, so the pepper, the 10-character minimum and the rate limits make up the gap).
 - Sessions: random 256-bit token; only its SHA-256 is stored; 7-day expiry; logout and password reset delete sessions.
 - No account enumeration: sign-up and forgot-password answer the same whether or not the email exists; login has one generic error.
+- Changing the password or email needs the current password again; a stolen session alone cannot lock the owner out. Changing the
+  password signs out every other device; changing the email tells the old address. Wrong-password replies use 400/403, never 401,
+  because the pages treat 401 as "your session ended".
+- Terms acceptance is enforced on the server, not just by the popup. Accounts made before it existed keep `NULL` (no record is
+  invented); the Account page says so. Bump `TERMS_VERSION` when the Terms or Privacy Policy change in a way that matters.
+- Only the browser, system and country of a sign-in are stored (no IP address); IPs appear only in short-lived rate-limit counters.
 - Rate limits (KV counters): sign-up, login, reset, ticket submission, account deletion, gate login, ticket info.
 - The admin panel is reached only via the hidden (c) on the Terms page, which leaves a 30-minute pass that `admin.html`
   checks. This hides the panel; it is not security. The admin password and its rate limit are what protect it.

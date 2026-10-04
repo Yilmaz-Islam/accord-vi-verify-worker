@@ -9,7 +9,7 @@
 // token in the Authorization header (not a cookie, for the same cross-site
 // reason as the admin login).
 //
-//   /account/signup/request   { name, email, password }       -> emails a 6-digit code
+//   /account/signup/request   { name, email, password, acceptTerms: true } -> emails a 6-digit code
 //   /account/signup/verify    { email, code }                 -> creates the account, returns { token, user }
 //   /account/login            { email, password }             -> { token, user }
 //   /account/logout           (Bearer)                        -> deletes this session
@@ -152,13 +152,59 @@ function passwordProblem(password, email) {
 
 // ---------- sessions ----------
 
-async function createSession(env, userId) {
+// "Chrome on Windows", from a User-Agent string. Deliberately coarse: it is shown in
+// "where you're logged in" and in emails, and used to recognise a device.
+function describeDevice(ua) {
+  const s = String(ua || '');
+  let browser = 'Unknown browser';
+  if (/Edg(e|A|iOS)?\//.test(s)) browser = 'Edge'; // Edge sends Edg/ (desktop), EdgA/ (Android), EdgiOS/ (iPhone)
+  else if (/OPR\/|Opera/.test(s)) browser = 'Opera';
+  else if (/SamsungBrowser/.test(s)) browser = 'Samsung Internet';
+  else if (/Firefox\//.test(s)) browser = 'Firefox';
+  else if (/Chrome\/|CriOS\//.test(s)) browser = 'Chrome';
+  else if (/Safari\//.test(s)) browser = 'Safari';
+  let os = 'Unknown device';
+  if (/iPhone/.test(s)) os = 'iPhone';
+  else if (/iPad/.test(s)) os = 'iPad';
+  else if (/Android/.test(s)) os = 'Android';
+  else if (/Windows/.test(s)) os = 'Windows';
+  else if (/Mac OS X|Macintosh/.test(s)) os = 'Mac';
+  else if (/CrOS/.test(s)) os = 'ChromeOS';
+  else if (/Linux/.test(s)) os = 'Linux';
+  return `${browser} on ${os}`;
+}
+
+const COUNTRY_NAMES = (() => {
+  try {
+    return new Intl.DisplayNames(['en'], { type: 'region' });
+  } catch {
+    return null;
+  }
+})();
+const countryName = (code) => {
+  if (!code || !/^[A-Z]{2}$/.test(code)) return '';
+  try {
+    return (COUNTRY_NAMES && COUNTRY_NAMES.of(code)) || code;
+  } catch {
+    return code;
+  }
+};
+
+function requestMeta(request) {
+  return {
+    userAgent: String(request.headers.get('User-Agent') || '').slice(0, 300),
+    country: (request.headers.get('CF-IPCountry') || (request.cf && request.cf.country) || '').toUpperCase().slice(0, 2),
+  };
+}
+
+async function createSession(env, userId, request) {
   const token = b64u(crypto.getRandomValues(new Uint8Array(32)));
   const now = Math.floor(Date.now() / 1000);
+  const meta = request ? requestMeta(request) : { userAgent: '', country: '' };
   await env.DB.prepare(
-    'INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)'
+    'INSERT INTO sessions (token_hash, user_id, created_at, expires_at, user_agent, country, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?)'
   )
-    .bind(await sha256Hex(token), userId, now, now + SESSION_TTL_S)
+    .bind(await sha256Hex(token), userId, now, now + SESSION_TTL_S, meta.userAgent, meta.country, now)
     .run();
   // Opportunistic clean-up of dead sessions; cheap and keeps the table small.
   await env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(now).run();
@@ -171,16 +217,42 @@ async function authenticate(env, request) {
   if (!token) return null;
   const now = Math.floor(Date.now() / 1000);
   const row = await env.DB.prepare(
-    `SELECT s.token_hash AS tokenHash, u.id AS id, u.email AS email, u.name AS name, u.created_at AS createdAt
+    `SELECT s.token_hash AS tokenHash, s.last_seen AS lastSeen, u.id AS id, u.email AS email, u.name AS name,
+            u.created_at AS createdAt, u.login_alerts AS loginAlerts, u.avatar_color AS avatarColor,
+            u.terms_accepted_at AS termsAcceptedAt, u.terms_version AS termsVersion
        FROM sessions s JOIN users u ON u.id = s.user_id
       WHERE s.token_hash = ? AND s.expires_at > ?`
   )
     .bind(await sha256Hex(token), now)
     .first();
+  // "Last active" for the device list, refreshed at most every 10 minutes to keep writes low.
+  if (row && (!row.lastSeen || now - row.lastSeen > 600)) {
+    await env.DB.prepare('UPDATE sessions SET last_seen = ? WHERE token_hash = ?').bind(now, row.tokenHash).run();
+  }
   return row || null;
 }
 
-const publicUser = (u) => ({ email: u.email, name: u.name, createdAt: u.createdAt });
+const AVATAR_COLORS = ['#e0b455', '#e0555a', '#5fcf8f', '#6aa8ff', '#b184ff', '#ff8fb1', '#4fd1d9', '#ff9d4d'];
+
+// Date of the Terms and Privacy Policy text people agree to at sign-up. Bump it when either
+// page changes in a way that matters; the stored value shows which version each person accepted.
+const TERMS_VERSION = '2026-10-04';
+
+const publicUser = (u) => ({
+  email: u.email,
+  name: u.name,
+  createdAt: u.createdAt,
+  loginAlerts: !!u.loginAlerts,
+  avatarColor: u.avatarColor || null,
+  termsAcceptedAt: u.termsAcceptedAt || null,
+  termsVersion: u.termsVersion || null,
+});
+
+const maskEmail = (email) => {
+  const [local, domain] = String(email).split('@');
+  return `${local.slice(0, 1)}${'•'.repeat(Math.max(2, Math.min(6, local.length - 1)))}@${domain}`;
+};
+const whenText = () => `${new Date().toUTCString().replace(' GMT', '')} UTC`;
 
 // ---------- tickets: validation and pricing ----------
 
@@ -397,6 +469,92 @@ function confirmedEmailBase(env, user, t) {
       { label: 'Event info', url: `${siteUrl(env)}/info.html` },
     ],
   ];
+}
+
+// ---------- security notices (sent to the person's own inbox) ----------
+
+const siteHome = (env) => `${siteUrl(env)}/index.html`;
+
+function passwordChangedEmail(env, user, request) {
+  const meta = requestMeta(request);
+  const place = countryName(meta.country);
+  const name = siteName(env);
+  const lines = [
+    `Hi ${user.name},`,
+    '',
+    `Your ${name} password was changed on ${whenText()}.`,
+    `Device: ${describeDevice(meta.userAgent)}${place ? `, ${place}` : ''}`,
+    '',
+    'If this was you, there is nothing more to do. We also signed you out of your other devices.',
+    '',
+    'If it was not you, reset your password right away and contact us.',
+    '',
+    `${name} organising team`,
+  ];
+  return [`${name}: your password was changed`, lines.join('\n'), [{ label: 'Reset my password', url: `${siteUrl(env)}/account.html#forgot` }]];
+}
+
+// Sent to the OLD address, so a hijacker cannot quietly move an account to a new email.
+function emailChangedEmail(env, user, newEmail) {
+  const name = siteName(env);
+  const lines = [
+    `Hi ${user.name},`,
+    '',
+    `The sign-in email for your ${name} account was changed on ${whenText()}.`,
+    `New address: ${maskEmail(newEmail)}`,
+    '',
+    'If this was you, there is nothing more to do. We also signed you out of your other devices.',
+    '',
+    'If it was not you, please reply to this email right away.',
+    '',
+    `${name} organising team`,
+  ];
+  return [`${name}: your account email was changed`, lines.join('\n'), [{ label: `Visit ${name}`, url: siteHome(env) }]];
+}
+
+function newSignInEmail(env, user, request) {
+  const meta = requestMeta(request);
+  const place = countryName(meta.country);
+  const name = siteName(env);
+  const lines = [
+    `Hi ${user.name},`,
+    '',
+    `Someone signed in to your ${name} account from a device we haven't seen before.`,
+    '',
+    `Device: ${describeDevice(meta.userAgent)}${place ? `, ${place}` : ''}`,
+    `When: ${whenText()}`,
+    '',
+    'If this was you, no action is needed.',
+    'If it was not you, reset your password now. That signs the other device out.',
+    '',
+    `${name} organising team`,
+  ];
+  return [`${name}: new sign-in to your account`, lines.join('\n'), [{ label: 'Reset my password', url: `${siteUrl(env)}/account.html#forgot` }]];
+}
+
+// Remembers which devices (browser + system + country) have signed in before. A new
+// one sends a "new sign-in" email, only if the person turned alerts on, and never for
+// the very first device (nothing to compare with).
+async function noteDevice(ctx, user, request) {
+  const { env } = ctx;
+  const meta = requestMeta(request);
+  const hash = (await sha256Hex(`${describeDevice(meta.userAgent)}|${meta.country}`)).slice(0, 32);
+  const known = await env.DB.prepare('SELECT 1 AS x FROM known_devices WHERE user_id = ? AND device_hash = ?')
+    .bind(user.id, hash)
+    .first();
+  if (known) return;
+  const hadAny = await env.DB.prepare('SELECT 1 AS x FROM known_devices WHERE user_id = ? LIMIT 1').bind(user.id).first();
+  await env.DB.prepare('INSERT OR IGNORE INTO known_devices (user_id, device_hash, first_seen) VALUES (?, ?, ?)')
+    .bind(user.id, hash, new Date().toISOString())
+    .run();
+  if (user.loginAlerts && hadAny) {
+    try {
+      const [subject, message, buttons] = newSignInEmail(env, user, request);
+      await sendUserEmail(ctx, user.email, user.name, subject, message, '', buttons);
+    } catch (err) {
+      console.log('sendEmail (new sign-in) failed:', err.message);
+    }
+  }
 }
 
 function deletedEmail(env, user) {
@@ -728,6 +886,11 @@ export async function handleAccount(ctx) {
     if (!name) return fail('Enter your name', 400);
     const problem = passwordProblem(body.password, email);
     if (problem) return fail(problem, 400);
+    // The page shows a popup the person has to tick; the server does not take its word for it
+    // being skipped. Only a literal `true` counts.
+    if (body.acceptTerms !== true) {
+      return fail('You need to accept the Terms and the Privacy Policy to create an account', 400);
+    }
 
     if (!(await checkRateLimit(env, `rl:acct-signup-ip:${ip}`, 10, 3600))) {
       return fail('Too many attempts. Please try again later', 429);
@@ -745,7 +908,14 @@ export async function handleAccount(ctx) {
     const code = secureCode();
     await env.CODES.put(
       `acct-signup:${email}`,
-      JSON.stringify({ code, attempts: 0, name, pwHash: await hashPassword(env, body.password) }),
+      JSON.stringify({
+        code,
+        attempts: 0,
+        name,
+        pwHash: await hashPassword(env, body.password),
+        termsVersion: TERMS_VERSION,
+        termsAt: new Date().toISOString(), // when they ticked the box, not when the email was confirmed
+      }),
       { expirationTtl: CODE_TTL_S }
     );
     try {
@@ -780,9 +950,9 @@ export async function handleAccount(ctx) {
     let userId;
     try {
       const res = await env.DB.prepare(
-        'INSERT INTO users (email, name, pw_hash, created_at, email_verified_at) VALUES (?, ?, ?, ?, ?)'
+        'INSERT INTO users (email, name, pw_hash, created_at, email_verified_at, terms_accepted_at, terms_version) VALUES (?, ?, ?, ?, ?, ?, ?)'
       )
-        .bind(email, pending.name, pending.pwHash, now, now)
+        .bind(email, pending.name, pending.pwHash, now, now, pending.termsAt || now, pending.termsVersion || TERMS_VERSION)
         .run();
       userId = res.meta.last_row_id;
     } catch (err) {
@@ -791,8 +961,20 @@ export async function handleAccount(ctx) {
       throw err;
     }
 
-    const token = await createSession(env, userId);
-    return ok({ token, user: { email, name: pending.name, createdAt: now } });
+    const token = await createSession(env, userId, request);
+    await noteDevice(ctx, { id: userId, email, name: pending.name, loginAlerts: false }, request);
+    return ok({
+      token,
+      user: {
+        email,
+        name: pending.name,
+        createdAt: now,
+        loginAlerts: false,
+        avatarColor: null,
+        termsAcceptedAt: pending.termsAt || now,
+        termsVersion: pending.termsVersion || TERMS_VERSION,
+      },
+    });
   }
 
   // ----- login -----
@@ -809,7 +991,9 @@ export async function handleAccount(ctx) {
     }
 
     const user = await env.DB.prepare(
-      'SELECT id, email, name, pw_hash AS pwHash, created_at AS createdAt FROM users WHERE email = ?'
+      `SELECT id, email, name, pw_hash AS pwHash, created_at AS createdAt,
+              login_alerts AS loginAlerts, avatar_color AS avatarColor,
+              terms_accepted_at AS termsAcceptedAt, terms_version AS termsVersion FROM users WHERE email = ?`
     )
       .bind(email)
       .first();
@@ -817,7 +1001,8 @@ export async function handleAccount(ctx) {
     const good = await verifyPassword(env, password, user ? user.pwHash : DUMMY_HASH);
     if (!user || !good) return fail('Incorrect email or password', 401);
 
-    const token = await createSession(env, user.id);
+    const token = await createSession(env, user.id, request);
+    await noteDevice(ctx, user, request);
     return ok({ token, user: publicUser(user) });
   }
 
@@ -910,6 +1095,210 @@ export async function handleAccount(ctx) {
     if (!name) return fail('Enter your name', 400);
     await env.DB.prepare('UPDATE users SET name = ? WHERE id = ?').bind(name, me.id).run();
     return ok({ user: publicUser({ ...me, name }) });
+  }
+
+  // A wrong current password or code in the routes below answers 400/403, never 401:
+  // the pages read 401 as "your session ended" and would sign the person out.
+  const iso = (seconds) => new Date(seconds * 1000).toISOString();
+
+  // ----- password: change (needs the current password; signs out the other devices) -----
+  if (path === '/account/password/change') {
+    if (!(await checkRateLimit(env, `rl:acct-pwchange:${me.id}`, 8, 600))) {
+      return fail('Too many attempts. Please wait a few minutes', 429);
+    }
+    const current = typeof body.current === 'string' ? body.current : '';
+    const next = typeof body.next === 'string' ? body.next : '';
+    if (!current || current.length > 128) return fail('Enter your current password', 400);
+    const row = await env.DB.prepare('SELECT pw_hash AS pwHash FROM users WHERE id = ?').bind(me.id).first();
+    if (!row || !(await verifyPassword(env, current, row.pwHash))) return fail('Your current password is incorrect', 403);
+    const problem = passwordProblem(next, me.email);
+    if (problem) return fail(problem, 400);
+    if (next === current) return fail('Choose a password different from your current one', 400);
+
+    const pwHash = await hashPassword(env, next);
+    await env.DB.batch([
+      env.DB.prepare('UPDATE users SET pw_hash = ?, pw_changed_at = ? WHERE id = ?').bind(pwHash, new Date().toISOString(), me.id),
+      env.DB.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').bind(me.id, me.tokenHash),
+    ]);
+    try {
+      const [subject, message, buttons] = passwordChangedEmail(env, me, request);
+      await sendUserEmail(ctx, me.email, me.name, subject, message, '', buttons);
+    } catch (err) {
+      console.log('sendEmail (password changed) failed:', err.message);
+    }
+    return ok();
+  }
+
+  // ----- email: change (current password, then a code sent to the NEW address) -----
+  if (path === '/account/email/change/request') {
+    if (!(await checkRateLimit(env, `rl:acct-emailchange:${me.id}`, 5, 600))) {
+      return fail('Too many attempts. Please wait a few minutes', 429);
+    }
+    const password = typeof body.password === 'string' ? body.password : '';
+    const row = await env.DB.prepare('SELECT pw_hash AS pwHash FROM users WHERE id = ?').bind(me.id).first();
+    if (!password || password.length > 128 || !row || !(await verifyPassword(env, password, row.pwHash))) {
+      return fail('Your password is incorrect', 403);
+    }
+    const newEmail = cleanEmail(body.newEmail);
+    if (!newEmail) return fail('Enter a valid email address', 400);
+    if (newEmail === me.email) return fail('That is already your email address', 400);
+
+    // The answer is the same whether or not the address is free, so this cannot be used
+    // to find out who has an account.
+    const taken = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(newEmail).first();
+    if (taken) return ok();
+    const code = secureCode();
+    await env.CODES.put(`acct-email:${me.id}`, JSON.stringify({ code, attempts: 0, newEmail }), { expirationTtl: CODE_TTL_S });
+    try {
+      return ok(await deliverCode(newEmail, me.name, 'Change email', code));
+    } catch (err) {
+      console.log('sendEmail (email change code) failed:', err.message);
+      return fail('Could not send the verification email', 502);
+    }
+  }
+
+  if (path === '/account/email/change/verify') {
+    const key = `acct-email:${me.id}`;
+    const raw = await env.CODES.get(key);
+    if (!raw || !body.code) return fail('Code expired or not found. Please start again', 404);
+    const rec = JSON.parse(raw);
+    if (rec.attempts >= MAX_CODE_ATTEMPTS) {
+      await env.CODES.delete(key);
+      return fail('Too many attempts. Please start again', 429);
+    }
+    if (!safeEqualStr(rec.code, String(body.code).trim())) {
+      rec.attempts += 1;
+      await env.CODES.put(key, JSON.stringify(rec), { expirationTtl: CODE_TTL_S });
+      return fail('Incorrect code', 400);
+    }
+    await env.CODES.delete(key);
+
+    try {
+      await env.DB.prepare('UPDATE users SET email = ? WHERE id = ?').bind(rec.newEmail, me.id).run();
+    } catch (err) {
+      if (/UNIQUE/i.test(String(err.message))) return fail('That email address is no longer available', 409);
+      throw err;
+    }
+    await env.DB.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').bind(me.id, me.tokenHash).run();
+    try {
+      // told to the OLD address, so a hijacker cannot quietly move the account
+      const [subject, message, buttons] = emailChangedEmail(env, me, rec.newEmail);
+      await sendUserEmail(ctx, me.email, me.name, subject, message, '', buttons);
+    } catch (err) {
+      console.log('sendEmail (email changed notice) failed:', err.message);
+    }
+    return ok({ user: publicUser({ ...me, email: rec.newEmail }) });
+  }
+
+  // ----- where you're logged in -----
+  if (path === '/account/sessions') {
+    const now = Math.floor(Date.now() / 1000);
+    const { results } = await env.DB.prepare(
+      `SELECT token_hash AS tokenHash, created_at AS createdAt, last_seen AS lastSeen, user_agent AS userAgent, country
+         FROM sessions WHERE user_id = ? AND expires_at > ? ORDER BY COALESCE(last_seen, created_at) DESC`
+    ).bind(me.id, now).all();
+    return ok({
+      sessions: results.map((r) => ({
+        id: r.tokenHash.slice(0, 16),
+        device: describeDevice(r.userAgent),
+        country: countryName(r.country),
+        createdAt: iso(r.createdAt),
+        lastSeen: iso(r.lastSeen || r.createdAt),
+        current: r.tokenHash === me.tokenHash,
+      })),
+    });
+  }
+
+  if (path === '/account/sessions/revoke') {
+    const id = String(body.id || '');
+    if (!/^[0-9a-f]{16}$/.test(id)) return fail('Unknown device', 400);
+    if (me.tokenHash.startsWith(id)) return fail('That is the device you are using. Use Sign out instead', 400);
+    const res = await env.DB.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash LIKE ? AND token_hash != ?')
+      .bind(me.id, `${id}%`, me.tokenHash)
+      .run();
+    return ok({ removed: res.meta.changes });
+  }
+
+  if (path === '/account/sessions/revoke-others') {
+    const res = await env.DB.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?')
+      .bind(me.id, me.tokenHash)
+      .run();
+    return ok({ removed: res.meta.changes });
+  }
+
+  // ----- preferences: new sign-in alerts, avatar colour -----
+  if (path === '/account/prefs') {
+    const sets = [];
+    const binds = [];
+    const next = { ...me };
+    if ('loginAlerts' in body) {
+      next.loginAlerts = !!body.loginAlerts;
+      sets.push('login_alerts = ?');
+      binds.push(next.loginAlerts ? 1 : 0);
+    }
+    if ('avatarColor' in body) {
+      const c = body.avatarColor;
+      if (c !== null && !AVATAR_COLORS.includes(c)) return fail('Choose one of the offered colours', 400);
+      next.avatarColor = c;
+      sets.push('avatar_color = ?');
+      binds.push(c);
+    }
+    if (!sets.length) return fail('Nothing to change', 400);
+    await env.DB.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).bind(...binds, me.id).run();
+    return ok({ user: publicUser(next) });
+  }
+
+  // ----- download my data -----
+  if (path === '/account/export') {
+    if (!(await checkRateLimit(env, `rl:acct-export:${me.id}`, 5, 3600))) {
+      return fail('Too many downloads. Please try again later', 429);
+    }
+    const reg = await env.DB.prepare(
+      `SELECT id, persona, hear_about AS hearAbout, attendee_count AS attendeeCount, group_names AS groupNames,
+              sponsor_tier AS sponsorTier, pass, amount_pkr AS amountPkr, pay_method AS payMethod, receipt,
+              status, submitted_at AS submittedAt, confirmed_at AS confirmedAt
+         FROM tickets WHERE user_id = ?`
+    ).bind(me.id).first();
+    let earlier = [];
+    let people = [];
+    if (reg) {
+      earlier = (await env.DB.prepare(
+        `SELECT receipt, pay_method AS payMethod, amount_pkr AS amountPkr, submitted_at AS submittedAt, replaced_at AS replacedAt
+           FROM receipt_history WHERE ticket_id = ? ORDER BY replaced_at`
+      ).bind(reg.id).all()).results;
+      people = (await env.DB.prepare(
+        'SELECT seq, holder_name AS holderName, admitted_at AS admittedAt FROM attendee_tickets WHERE ticket_id = ? ORDER BY seq'
+      ).bind(reg.id).all()).results;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const devices = (await env.DB.prepare(
+      'SELECT created_at AS createdAt, last_seen AS lastSeen, user_agent AS userAgent, country FROM sessions WHERE user_id = ? AND expires_at > ?'
+    ).bind(me.id, now).all()).results;
+    if (reg) delete reg.id;
+    return ok({
+      export: {
+        exportedAt: new Date().toISOString(),
+        note: 'Everything we hold about your account. Your password is stored only as a one-way hash, so it is not included.',
+        account: {
+          name: me.name,
+          email: me.email,
+          createdAt: me.createdAt,
+          signInAlerts: !!me.loginAlerts,
+          avatarColor: me.avatarColor || null,
+          termsAcceptedAt: me.termsAcceptedAt || null,
+          termsVersion: me.termsVersion || null,
+        },
+        registration: reg || null,
+        earlierReceipts: earlier,
+        tickets: people,
+        signedInDevices: devices.map((d) => ({
+          device: describeDevice(d.userAgent),
+          country: countryName(d.country),
+          signedInAt: iso(d.createdAt),
+          lastActive: iso(d.lastSeen || d.createdAt),
+        })),
+      },
+    });
   }
 
   // ----- the person's own QR tickets (only exist once the payment is confirmed) -----
@@ -1012,8 +1401,10 @@ export async function handleAccount(ctx) {
       env.DB.prepare('DELETE FROM attendee_tickets WHERE ticket_id IN (SELECT id FROM tickets WHERE user_id = ?)').bind(me.id),
       env.DB.prepare('DELETE FROM receipt_history WHERE ticket_id IN (SELECT id FROM tickets WHERE user_id = ?)').bind(me.id),
       env.DB.prepare('DELETE FROM tickets WHERE user_id = ?').bind(me.id),
+      env.DB.prepare('DELETE FROM known_devices WHERE user_id = ?').bind(me.id),
       env.DB.prepare('DELETE FROM users WHERE id = ?').bind(me.id),
     ]);
+    await env.CODES.delete(`acct-email:${me.id}`);
     // The older-style log (reg:... entries) and any half-finished codes also hold this
     // person's details, so they go too.
     await purgeLegacyLogs(env, me.email);

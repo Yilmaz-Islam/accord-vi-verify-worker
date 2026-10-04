@@ -42,7 +42,7 @@ async function call(path, body, token) {
 
 async function newUser(prefix, name, password) {
   const email = `${prefix}+${stamp}@example.com`;
-  let r = await call('/account/signup/request', { name, email, password });
+  let r = await call('/account/signup/request', { name, email, password, acceptTerms: true });
   r = await call('/account/signup/verify', { email, code: r.data.devCode });
   return { email, token: r.data.token };
 }

@@ -37,14 +37,28 @@ async function call(path, body, token) {
 }
 
 console.log('sign-up');
-let r = await call('/account/signup/request', { name: 'Test User', email, password: 'short' });
+let r = await call('/account/signup/request', { name: 'Test User', email, password: 'short', acceptTerms: true });
 check('rejects a short password', r.status === 400, r);
-r = await call('/account/signup/request', { name: 'Test User', email, password: 'password123' });
+r = await call('/account/signup/request', { name: 'Test User', email, password: 'password123', acceptTerms: true });
 check('rejects a common password', r.status === 400, r);
-r = await call('/account/signup/request', { name: 'Test User', email: 'not-an-email', password: PW });
+r = await call('/account/signup/request', { name: 'Test User', email: 'not-an-email', password: PW, acceptTerms: true });
 check('rejects a bad email', r.status === 400, r);
 
+console.log('terms and privacy acceptance');
 r = await call('/account/signup/request', { name: 'Test User', email, password: PW });
+check('refuses a sign-up that never mentions the terms', r.status === 400 && /Terms/.test(r.data.error || ''), r);
+r = await call('/account/signup/request', { name: 'Test User', email, password: PW, acceptTerms: false });
+check('refuses acceptTerms: false', r.status === 400 && !r.data.devCode, r);
+r = await call('/account/signup/request', { name: 'Test User', email, password: PW, acceptTerms: 'true' });
+check('refuses the string "true" (only a real true counts)', r.status === 400 && !r.data.devCode, r);
+r = await call('/account/signup/request', { name: 'Test User', email, password: PW, acceptTerms: 1 });
+check('refuses 1 (only a real true counts)', r.status === 400 && !r.data.devCode, r);
+r = await call('/account/signup/verify', { email, code: '123456' });
+check('a refused sign-up left nothing pending to verify', r.status === 404, r);
+
+console.log('sign-up (accepted)');
+const beforeAccept = Date.now() - 2000;
+r = await call('/account/signup/request', { name: 'Test User', email, password: PW, acceptTerms: true });
 check('accepts a valid sign-up and returns a code in dev mode', r.status === 200 && /^\d{6}$/.test(r.data.devCode || ''), r);
 const code = r.data.devCode;
 
@@ -53,12 +67,21 @@ check('wrong code is rejected', r.status === 401, r);
 r = await call('/account/signup/verify', { email, code });
 check('right code creates the account and signs in', r.status === 200 && !!r.data.token && r.data.user?.email === email, r);
 const token1 = r.data.token;
+check(
+  'the new account records when and what was accepted',
+  /^\d{4}-\d{2}-\d{2}$/.test(r.data.user.termsVersion || '') &&
+    Date.parse(r.data.user.termsAcceptedAt) >= beforeAccept &&
+    Date.parse(r.data.user.termsAcceptedAt) <= Date.now() + 2000,
+  r.data.user
+);
+const acceptedAt = r.data.user.termsAcceptedAt;
 r = await call('/account/signup/verify', { email, code });
 check('a code cannot be used twice', r.status === 404, r);
 
 console.log('session + profile');
 r = await call('/account/me', {}, token1);
 check('/me works with the token', r.status === 200 && r.data.user.name === 'Test User' && r.data.ticket === null, r);
+check('/me still shows the same acceptance record', r.data.user.termsAcceptedAt === acceptedAt && !!r.data.user.termsVersion, r.data.user);
 r = await call('/account/me', {});
 check('/me without a token is 401', r.status === 401, r);
 r = await call('/account/me', {}, 'not-a-real-token');
@@ -69,7 +92,7 @@ r = await call('/account/me', {}, token1);
 check('a new account has no ticket yet', r.status === 200 && r.data.ticket === null, r);
 
 console.log('duplicate + enumeration');
-r = await call('/account/signup/request', { name: 'Someone Else', email, password: PW });
+r = await call('/account/signup/request', { name: 'Someone Else', email, password: PW, acceptTerms: true });
 check('sign-up for an existing email looks identical (no devCode, status 200)', r.status === 200 && !r.data.devCode, r);
 
 console.log('login + logout');
@@ -79,6 +102,7 @@ r = await call('/account/login', { email: `nobody+${stamp}@example.com`, passwor
 check('unknown email gives the same message as a wrong password', r.status === 401 && r.data.error === 'Incorrect email or password', r);
 r = await call('/account/login', { email: email.toUpperCase(), password: PW });
 check('login works and email is case-insensitive', r.status === 200 && !!r.data.token, r);
+check('login returns the acceptance record too', r.data.user.termsAcceptedAt === acceptedAt, r.data.user);
 const token2 = r.data.token;
 r = await call('/account/logout', {}, token2);
 check('logout succeeds', r.status === 200, r);
