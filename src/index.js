@@ -14,7 +14,7 @@
 // (EmailJS's free plan caps templates at 2, and the organizer-notification
 // template already uses one of them).
 
-import { handleAccount, handleAdminTickets, emailHtml } from './accounts.js';
+import { handleAccount, handleAdminTickets, handleGate, emailHtml } from './accounts.js';
 
 function corsHeaders(origin, env) {
   const allowed = env.ALLOWED_ORIGINS.split(',').map((s) => s.trim());
@@ -304,9 +304,14 @@ export default {
     if (url.pathname.startsWith('/account/')) {
       return handleAccount({ request, env, url, body, cors, json, checkRateLimit, sendEmail });
     }
-    if (['/admin/tickets', '/admin/ticket-receipt', '/admin/ticket-confirm'].includes(url.pathname)) {
+    if (['/admin/tickets', '/admin/ticket-receipt', '/admin/ticket-history', '/admin/ticket-confirm'].includes(url.pathname)) {
       const isAdmin = (req) => verifySessionToken(env, bearerToken(req));
       return handleAdminTickets({ request, env, url, body, cors, json, sendEmail, isAdmin });
+    }
+    // QR tickets: the public ticket page, and the gate scanner (its own password, or an admin token)
+    if (url.pathname === '/ticket/info' || url.pathname.startsWith('/gate/')) {
+      const isAdmin = (req) => verifySessionToken(env, bearerToken(req));
+      return handleGate({ request, env, url, body, cors, json, checkRateLimit, isAdmin });
     }
 
     // Local testing only: shows the emails the worker would have sent.

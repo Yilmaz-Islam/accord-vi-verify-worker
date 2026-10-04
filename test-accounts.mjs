@@ -123,6 +123,11 @@ r = await call('/account/me', {}, token3);
 check('the session is gone after deletion', r.status === 401, r);
 r = await call('/account/login', { email, password: PW2 });
 check('the account no longer exists', r.status === 401, r);
+{
+  const ob = await call('/dev/outbox', {});
+  const gone = ob.data.outbox.filter((m) => m.kind === 'user' && m.to === email && /account has been deleted/i.test(m.subject));
+  check('an "account deleted" email was sent to the person', gone.length === 1 && /backups/i.test(gone[0].message), gone.length);
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

@@ -44,3 +44,31 @@ CREATE TABLE IF NOT EXISTS tickets (
   confirmed_at   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status, submitted_at);
+
+-- Every receipt that gets replaced while a ticket is still pending is kept here,
+-- so a re-upload never silently destroys the earlier one. Deleted with the account.
+CREATE TABLE IF NOT EXISTS receipt_history (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id    INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  receipt      TEXT    NOT NULL,
+  pay_method   TEXT    NOT NULL,
+  amount_pkr   INTEGER NOT NULL,
+  submitted_at TEXT    NOT NULL,   -- when that receipt was first submitted
+  replaced_at  TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_receipt_history_ticket ON receipt_history(ticket_id);
+
+-- One row per person who is allowed in: created when a payment is confirmed
+-- (a group of 4 gets 4 rows). The QR code carries `id` plus a signature that only
+-- the server can make (see TICKET_SECRET), and admitted_at is set the first time
+-- someone is let in, so a copied ticket is refused the second time.
+CREATE TABLE IF NOT EXISTS attendee_tickets (
+  id          TEXT    PRIMARY KEY,                 -- random 96-bit id (base64url)
+  ticket_id   INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  seq         INTEGER NOT NULL,                    -- 1..attendee_count
+  holder_name TEXT    NOT NULL,
+  created_at  TEXT    NOT NULL,
+  admitted_at TEXT,
+  UNIQUE (ticket_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_attendee_name ON attendee_tickets(holder_name COLLATE NOCASE);

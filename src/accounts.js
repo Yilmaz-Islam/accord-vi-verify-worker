@@ -347,7 +347,31 @@ function pendingEmail(env, user, t) {
   ];
 }
 
-function confirmedEmail(env, user, t) {
+// The confirmation email: the payment details plus, once tickets exist, one link and
+// one button per person. Each link opens that person's own QR ticket.
+function confirmedEmail(env, user, t, tickets = []) {
+  const [subject, message, baseButtons] = confirmedEmailBase(env, user, t);
+  if (!tickets.length) return [subject, message, baseButtons];
+  const site = siteUrl(env);
+  const link = (tk) => `${site}/ticket.html#${tk.code}`;
+  const extra = ['', tickets.length === 1 ? 'Your ticket:' : `Your ${tickets.length} tickets (one per person, each works once):`];
+  for (const tk of tickets) extra.push(`Ticket ${tk.seq} of ${tickets.length}, ${tk.holderName}: ${link(tk)}`);
+  extra.push(
+    '',
+    'At the gate, staff scan the QR code on the ticket and ask for the name it is under. Keep it ready on your phone and do not share it: each ticket admits one person, once.'
+  );
+  const lines = message.split('\n');
+  const signature = lines.pop();
+  lines.pop(); // the blank line before the signature
+  lines.push(...extra, '', signature);
+  const ticketButtons =
+    tickets.length === 1
+      ? [{ label: 'Open my ticket', url: link(tickets[0]) }]
+      : tickets.slice(0, 8).map((tk) => ({ label: `Ticket ${tk.seq}: ${tk.holderName}`.slice(0, 42), url: link(tk) }));
+  return [subject, lines.join('\n'), [...ticketButtons, ...baseButtons]];
+}
+
+function confirmedEmailBase(env, user, t) {
   const name = siteName(env);
   const lines = [
     `Hi ${user.name},`,
@@ -375,6 +399,41 @@ function confirmedEmail(env, user, t) {
   ];
 }
 
+function deletedEmail(env, user) {
+  const name = siteName(env);
+  const lines = [
+    `Hi ${user.name},`,
+    '',
+    `Your ${name} account has been deleted, as you asked. We have removed your sign-in, your registration and any payment receipt you uploaded from our records.`,
+    '',
+    'Copies held in our automatic backups are removed on a schedule, within 30 days.',
+    '',
+    'If you did not ask for this, please reply to this email right away.',
+    '',
+    `${name} organising team`,
+  ];
+  return [`${name}: your account has been deleted`, lines.join('\n'), [{ label: `Visit ${name}`, url: `${siteUrl(env)}/index.html` }]];
+}
+
+// Removes every trace of an email address from the key-value store: the older
+// registration log (reg:<time>:<email>) and any pending sign-up or reset codes.
+async function purgeLegacyLogs(env, email) {
+  const lower = String(email).toLowerCase();
+  let cursor;
+  do {
+    const page = await env.CODES.list({ prefix: 'reg:', cursor });
+    for (const k of page.keys) {
+      if (k.name.toLowerCase().endsWith(`:${lower}`)) await env.CODES.delete(k.name);
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  await Promise.all([
+    env.CODES.delete(`code:${lower}`),
+    env.CODES.delete(`acct-signup:${lower}`),
+    env.CODES.delete(`acct-reset:${lower}`),
+  ]);
+}
+
 async function notifyOrganisers(ctx, user, t) {
   const { env, sendEmail } = ctx;
   const details = [
@@ -399,6 +458,162 @@ async function notifyOrganisers(ctx, user, t) {
   await sendEmail(env, env.EMAILJS_NOTIFY_TEMPLATE_ID, params);
 }
 
+// ---------- attendee tickets: signed QR codes ----------
+// Each person who is allowed in gets a ticket row. Its code is
+//   A6.<random 96-bit id>.<signature>
+// where the signature is an HMAC made with TICKET_SECRET, which only the server
+// knows. Nobody (and no AI) can invent a code that passes: without the secret a
+// made-up signature never matches. The server also remembers who has been let in,
+// so a copied ticket works once at most.
+
+async function hmacB64(secret, message) {
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return b64u(await crypto.subtle.sign('HMAC', key, enc.encode(message)));
+}
+
+const newTicketId = () => b64u(crypto.getRandomValues(new Uint8Array(12)));
+
+async function ticketCode(env, id) {
+  const sig = (await hmacB64(env.TICKET_SECRET, `ticket:${id}`)).slice(0, 22);
+  return `A6.${id}.${sig}`;
+}
+
+// Returns the ticket id if the code is genuine, otherwise null.
+async function ticketIdFromCode(env, code) {
+  const m = /^A6\.([A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]{22})$/.exec(String(code || '').trim());
+  if (!m) return null;
+  const expected = (await hmacB64(env.TICKET_SECRET, `ticket:${m[1]}`)).slice(0, 22);
+  return timingSafeEqual(enc.encode(m[2]), enc.encode(expected)) ? m[1] : null;
+}
+
+// Whose name goes on each ticket: the names the group leader typed, then "Guest n".
+function attendeeNames(accountName, persona, count, groupNames) {
+  if (persona !== 'group') return [accountName];
+  const listed = String(groupNames || '').split(/\n|,/).map((s) => s.trim()).filter(Boolean);
+  const names = listed.length ? listed.slice(0, count) : [accountName];
+  while (names.length < count) names.push(`Guest ${names.length + 1} (${accountName}'s group)`);
+  return names;
+}
+
+// Creates the per-person tickets for a confirmed payment. Safe to call twice.
+async function createAttendeeTickets(env, ticketId, accountName, persona, count, groupNames) {
+  const names = attendeeNames(accountName, persona, count, groupNames);
+  const now = new Date().toISOString();
+  await env.DB.batch(
+    names.map((holder, i) =>
+      env.DB.prepare(
+        'INSERT OR IGNORE INTO attendee_tickets (id, ticket_id, seq, holder_name, created_at) VALUES (?, ?, ?, ?, ?)'
+      ).bind(newTicketId(), ticketId, i + 1, holder, now)
+    )
+  );
+}
+
+async function loadTicketsWithCodes(env, ticketId) {
+  const { results } = await env.DB.prepare(
+    'SELECT id, seq, holder_name AS holderName FROM attendee_tickets WHERE ticket_id = ? ORDER BY seq'
+  ).bind(ticketId).all();
+  return Promise.all(results.map(async (r) => ({ ...r, code: await ticketCode(env, r.id) })));
+}
+
+// ---------- gate: scanning tickets at the door ----------
+// The gate has its own password (GATE_PASSWORD) so door volunteers can scan and
+// admit, but cannot see receipts or any registration list. An admin token also works.
+
+const GATE_TTL_MS = 12 * 60 * 60 * 1000;
+
+async function makeGateToken(env) {
+  const expires = Date.now() + GATE_TTL_MS;
+  return `${expires}.${await hmacB64(env.GATE_PASSWORD, `gate:${expires}`)}`;
+}
+
+async function verifyGateToken(env, token) {
+  const [expiresStr, sig] = String(token || '').split('.');
+  const expires = Number.parseInt(expiresStr, 10);
+  if (!expires || !sig || Date.now() > expires || !env.GATE_PASSWORD) return false;
+  return timingSafeEqual(enc.encode(sig), enc.encode(await hmacB64(env.GATE_PASSWORD, `gate:${expires}`)));
+}
+
+export async function handleGate(ctx) {
+  const { request, env, url, body, cors, json, checkRateLimit, isAdmin } = ctx;
+  const fail = (msg, status) => json({ ok: false, error: msg }, status, cors);
+  const ok = (extra) => json({ ok: true, ...(extra || {}) }, 200, cors);
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  if (!env.DB || !env.TICKET_SECRET) return fail('Tickets are not configured on this server', 503);
+
+  const baseSelect = `SELECT a.id, a.seq, a.holder_name AS holderName, a.admitted_at AS admittedAt,
+                             t.attendee_count AS count, t.pass, t.persona, u.name AS purchaser
+                        FROM attendee_tickets a
+                        JOIN tickets t ON t.id = a.ticket_id
+                        JOIN users u ON u.id = t.user_id`;
+  const shape = (r) => ({
+    id: r.id,
+    holderName: r.holderName,
+    seq: r.seq,
+    of: r.count,
+    pass: r.pass,
+    purchaser: r.purchaser,
+    admittedAt: r.admittedAt || null,
+  });
+
+  // Public: what a ticket page needs to show (only holds for a genuine code).
+  if (url.pathname === '/ticket/info') {
+    if (!(await checkRateLimit(env, `rl:ticket-info:${ip}`, 60, 60))) return fail('Too many requests', 429);
+    const id = await ticketIdFromCode(env, body.code);
+    if (!id) return fail('This ticket code is not valid', 404);
+    const r = await env.DB.prepare(`${baseSelect} WHERE a.id = ?`).bind(id).first();
+    if (!r) return fail('This ticket code is not valid', 404);
+    return ok({ ticket: { holderName: r.holderName, seq: r.seq, of: r.count, pass: r.pass, used: !!r.admittedAt } });
+  }
+
+  if (url.pathname === '/gate/login') {
+    if (!(await checkRateLimit(env, `rl:gate-login:${ip}`, 20, 600))) return fail('Too many attempts. Please wait a few minutes', 429);
+    if (!env.GATE_PASSWORD) return fail('The gate is not configured on this server', 503);
+    const given = typeof body.password === 'string' ? body.password : '';
+    if (!timingSafeEqual(enc.encode(given), enc.encode(env.GATE_PASSWORD))) return fail('Incorrect password', 401);
+    return ok({ token: await makeGateToken(env) });
+  }
+
+  // everything below: a gate token or an admin token
+  const header = request.headers.get('Authorization') || '';
+  const bearer = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!((await verifyGateToken(env, bearer)) || (await isAdmin(request)))) return fail('Not signed in', 401);
+
+  if (url.pathname === '/gate/lookup') {
+    const id = await ticketIdFromCode(env, body.code);
+    if (!id) return json({ ok: true, valid: false, reason: 'not-genuine' }, 200, cors);
+    const r = await env.DB.prepare(`${baseSelect} WHERE a.id = ?`).bind(id).first();
+    if (!r) return json({ ok: true, valid: false, reason: 'unknown' }, 200, cors);
+    return ok({ valid: true, ticket: shape(r) });
+  }
+
+  if (url.pathname === '/gate/search') {
+    const q = String(body.q || '').trim().slice(0, 60);
+    if (q.length < 2) return ok({ matches: [] });
+    const like = `%${q.replace(/[%_\\]/g, (c) => `\\${c}`)}%`;
+    const { results } = await env.DB.prepare(
+      `${baseSelect} WHERE a.holder_name LIKE ? ESCAPE '\\' OR u.name LIKE ? ESCAPE '\\' ORDER BY a.holder_name LIMIT 15`
+    ).bind(like, like).all();
+    return ok({ matches: results.map(shape) });
+  }
+
+  if (url.pathname === '/gate/admit') {
+    // Accepts a scanned code, or the id from a name search.
+    let id = body.id ? String(body.id) : null;
+    if (body.code) id = await ticketIdFromCode(env, body.code);
+    if (!id) return fail('This ticket code is not valid', 404);
+    const now = new Date().toISOString();
+    // Only the first admit changes the row, so two scanners cannot both let the same ticket in.
+    const res = await env.DB.prepare('UPDATE attendee_tickets SET admitted_at = ? WHERE id = ? AND admitted_at IS NULL')
+      .bind(now, id)
+      .run();
+    const r = await env.DB.prepare(`${baseSelect} WHERE a.id = ?`).bind(id).first();
+    if (!r) return fail('Ticket not found', 404);
+    return ok({ admitted: res.meta.changes === 1, ticket: shape(r) });
+  }
+
+  return fail('Not found', 404);
+}
+
 // ---------- admin: review tickets and confirm payments ----------
 // Auth is the existing admin bearer token (see index.js); `isAdmin` checks it.
 
@@ -414,7 +629,8 @@ export async function handleAdminTickets(ctx) {
               t.status, t.attendee_count AS attendeeCount, t.group_names AS groupNames,
               t.hear_about AS hearAbout, t.sponsor_tier AS sponsorTier,
               t.submitted_at AS submittedAt, t.confirmed_at AS confirmedAt,
-              (t.receipt IS NOT NULL) AS hasReceipt
+              (t.receipt IS NOT NULL) AS hasReceipt,
+              (SELECT COUNT(*) FROM receipt_history h WHERE h.ticket_id = t.id) AS receiptCount
          FROM tickets t JOIN users u ON u.id = t.user_id
         ORDER BY (t.status = 'pending') DESC, t.submitted_at DESC`
     ).all();
@@ -423,6 +639,16 @@ export async function handleAdminTickets(ctx) {
 
   const id = Number.parseInt(body.id, 10);
   if (!Number.isInteger(id)) return fail('Missing ticket id', 400);
+
+  if (url.pathname === '/admin/ticket-history') {
+    // Receipts this person replaced while pending, newest first, so nothing is silently lost.
+    const { results } = await env.DB.prepare(
+      `SELECT id, receipt, pay_method AS payMethod, amount_pkr AS amountPkr,
+              submitted_at AS submittedAt, replaced_at AS replacedAt
+         FROM receipt_history WHERE ticket_id = ? ORDER BY replaced_at DESC`
+    ).bind(id).all();
+    return json({ ok: true, history: results }, 200, cors);
+  }
 
   if (url.pathname === '/admin/ticket-receipt') {
     const row = await env.DB.prepare('SELECT receipt FROM tickets WHERE id = ?').bind(id).first();
@@ -434,12 +660,15 @@ export async function handleAdminTickets(ctx) {
   if (url.pathname === '/admin/ticket-confirm') {
     const row = await env.DB.prepare(
       `SELECT t.id, t.persona, t.pass, t.amount_pkr AS amountPkr, t.attendee_count AS attendeeCount,
-              t.status, u.name, u.email
+              t.group_names AS groupNames, t.status, u.name, u.email
          FROM tickets t JOIN users u ON u.id = t.user_id WHERE t.id = ?`
     ).bind(id).first();
     if (!row) return fail('Ticket not found', 404);
     if (row.status === 'interest') return fail('Sponsor interest has no payment to confirm', 400);
     if (row.status === 'confirmed') return json({ ok: true, alreadyConfirmed: true }, 200, cors);
+    // Confirming creates the per-person tickets, which need the signing secret. Refuse
+    // up front rather than confirm a payment that cannot be given tickets.
+    if (!env.TICKET_SECRET) return fail('Ticket signing is not configured on this server', 503);
 
     // Only move pending -> confirmed, atomically, so a double click cannot email twice.
     const res = await env.DB.prepare(
@@ -447,15 +676,19 @@ export async function handleAdminTickets(ctx) {
     ).bind(new Date().toISOString(), id).run();
     if (!res.meta.changes) return json({ ok: true, alreadyConfirmed: true }, 200, cors);
 
+    // One ticket per person, each with its own signed code.
+    await createAttendeeTickets(env, row.id, row.name, row.persona, row.attendeeCount, row.groupNames);
+    const tickets = await loadTicketsWithCodes(env, row.id);
+
     let emailSent = true;
     try {
-      const [subject, message, buttons] = confirmedEmail(env, { name: row.name }, row);
+      const [subject, message, buttons] = confirmedEmail(env, { name: row.name }, row, tickets);
       await sendUserEmail(ctx, row.email, row.name, subject, message, '', buttons);
     } catch (err) {
       console.log('sendEmail (confirmed) failed:', err.message);
       emailSent = false;
     }
-    return json({ ok: true, emailSent }, 200, cors);
+    return json({ ok: true, emailSent, tickets: tickets.length }, 200, cors);
   }
 
   return fail('Not found', 404);
@@ -679,6 +912,27 @@ export async function handleAccount(ctx) {
     return ok({ user: publicUser({ ...me, name }) });
   }
 
+  // ----- the person's own QR tickets (only exist once the payment is confirmed) -----
+  if (path === '/account/tickets') {
+    if (!env.TICKET_SECRET) return fail('Tickets are not configured on this server', 503);
+    const owned = await env.DB.prepare('SELECT id FROM tickets WHERE user_id = ?').bind(me.id).first();
+    if (!owned) return ok({ tickets: [] });
+    const list = await loadTicketsWithCodes(env, owned.id);
+    const { results } = await env.DB.prepare(
+      'SELECT id, admitted_at AS admittedAt FROM attendee_tickets WHERE ticket_id = ?'
+    ).bind(owned.id).all();
+    const used = new Map(results.map((r) => [r.id, r.admittedAt]));
+    return ok({
+      tickets: list.map((tk) => ({
+        seq: tk.seq,
+        of: list.length,
+        holderName: tk.holderName,
+        code: tk.code,
+        used: !!used.get(tk.id),
+      })),
+    });
+  }
+
   // ----- register for the event: one ticket per account -----
   if (path === '/account/ticket/submit') {
     if (!(await checkRateLimit(env, `rl:acct-ticket:${me.id}`, 15, 3600))) {
@@ -687,12 +941,22 @@ export async function handleAccount(ctx) {
     const t = validateTicket(body);
     if (t.error) return fail(t.error, 400);
 
-    const existing = await env.DB.prepare('SELECT status FROM tickets WHERE user_id = ?').bind(me.id).first();
+    const existing = await env.DB.prepare(
+      'SELECT id, status, receipt, pay_method, amount_pkr, submitted_at FROM tickets WHERE user_id = ?'
+    ).bind(me.id).first();
     if (existing && existing.status === 'confirmed') {
       return fail('Your payment is already confirmed. Contact the organisers if you need to change anything', 409);
     }
 
     const now = new Date().toISOString();
+    // One registration per account. Replacing a pending one is allowed (for example to
+    // upload a clearer receipt), but the receipt being replaced is kept in history.
+    if (existing && existing.receipt) {
+      await env.DB.prepare(
+        `INSERT INTO receipt_history (ticket_id, receipt, pay_method, amount_pkr, submitted_at, replaced_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(existing.id, existing.receipt, existing.pay_method, existing.amount_pkr, existing.submitted_at, now).run();
+    }
     await env.DB.prepare(
       `INSERT INTO tickets (user_id, persona, hear_about, attendee_count, group_names, sponsor_tier,
                             pass, amount_pkr, pay_method, receipt, status, submitted_at)
@@ -745,10 +1009,26 @@ export async function handleAccount(ctx) {
     if (paid) return fail('Your payment is confirmed, so this account cannot be deleted online. Please contact the organisers', 409);
     await env.DB.batch([
       env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(me.id),
+      env.DB.prepare('DELETE FROM attendee_tickets WHERE ticket_id IN (SELECT id FROM tickets WHERE user_id = ?)').bind(me.id),
+      env.DB.prepare('DELETE FROM receipt_history WHERE ticket_id IN (SELECT id FROM tickets WHERE user_id = ?)').bind(me.id),
       env.DB.prepare('DELETE FROM tickets WHERE user_id = ?').bind(me.id),
       env.DB.prepare('DELETE FROM users WHERE id = ?').bind(me.id),
     ]);
-    return ok();
+    // The older-style log (reg:... entries) and any half-finished codes also hold this
+    // person's details, so they go too.
+    await purgeLegacyLogs(env, me.email);
+
+    // Tell them it is done. Sent after the deletion succeeded, so it never claims
+    // something that did not happen.
+    let emailSent = true;
+    try {
+      const [subject, message, buttons] = deletedEmail(env, me);
+      await sendUserEmail(ctx, me.email, me.name, subject, message, '', buttons);
+    } catch (err) {
+      console.log('sendEmail (deleted) failed:', err.message);
+      emailSent = false;
+    }
+    return ok({ emailSent });
   }
 
   return fail('Not found', 404);
