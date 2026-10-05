@@ -75,7 +75,7 @@ async function sha256Hex(text) {
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-function secureCode() {
+export function secureCode() {
   // Uniform 6 digits from the CSPRNG (rejection sampling avoids modulo bias).
   const buf = new Uint32Array(1);
   const limit = Math.floor(0xffffffff / 1000000) * 1000000;
@@ -85,7 +85,7 @@ function secureCode() {
   return String(100000 + (buf[0] % 900000));
 }
 
-function safeEqualStr(a, b) {
+export function safeEqualStr(a, b) {
   return timingSafeEqual(enc.encode(String(a)), enc.encode(String(b)));
 }
 
@@ -236,7 +236,7 @@ const AVATAR_COLORS = ['#e0b455', '#e0555a', '#5fcf8f', '#6aa8ff', '#b184ff', '#
 
 // Date of the Terms and Privacy Policy text people agree to at sign-up. Bump it when either
 // page changes in a way that matters; the stored value shows which version each person accepted.
-const TERMS_VERSION = '2026-10-04';
+const TERMS_VERSION = '2026-10-05';
 
 const publicUser = (u) => ({
   email: u.email,

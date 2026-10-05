@@ -14,7 +14,7 @@
 // (EmailJS's free plan caps templates at 2, and the organizer-notification
 // template already uses one of them).
 
-import { handleAccount, handleAdminTickets, handleGate, emailHtml } from './accounts.js';
+import { handleAccount, handleAdminTickets, handleGate, emailHtml, secureCode, safeEqualStr } from './accounts.js';
 
 function corsHeaders(origin, env) {
   const allowed = env.ALLOWED_ORIGINS.split(',').map((s) => s.trim());
@@ -30,13 +30,22 @@ function corsHeaders(origin, env) {
 function json(data, status, headers) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: {
+      'Content-Type': 'application/json',
+      // These answers carry sign-in tokens and personal details: never cache them, never let a
+      // browser guess that JSON is something else.
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      ...headers,
+    },
   });
 }
 
-function generateCode() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
+// The older public form flow (the sponsorship inquiry) accepts text from anyone and emails a code to whatever
+// address is given, so what it accepts is kept short, single-line and from a fixed list. Otherwise it could be
+// used to send a chosen message to a stranger from the organisers' address, or to use up the email quota.
+const LEGACY_FORM_TYPES = new Set(['Sponsorship Inquiry']);
+const oneLine = (v, max) => String(v == null ? '' : v).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
 
 // Simple fixed-window counter in the same KV namespace as the codes
 // themselves — good enough to stop casual abuse (someone hammering the
@@ -101,21 +110,26 @@ async function hmacSign(secret, message) {
 
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 
+// The signing key mixes the long random TICKET_SECRET into the admin password. A token used to be signed
+// with the password alone, so anyone who got hold of one token could try passwords against it offline;
+// with the secret in the key that guessing is not possible. Changing either one still signs everyone out.
+const sessionKey = (env) => `admin-session|${env.TICKET_SECRET || ''}|${env.ADMIN_PASSWORD}`;
+
 async function makeSessionToken(env) {
   const expires = Date.now() + SESSION_TTL_MS;
-  const sig = await hmacSign(env.ADMIN_PASSWORD, String(expires));
+  const sig = await hmacSign(sessionKey(env), String(expires));
   return `${expires}.${sig}`;
 }
 
 async function verifySessionToken(env, token) {
-  if (!token) return false;
+  if (!token || !env.ADMIN_PASSWORD) return false;
   const parts = token.split('.');
   if (parts.length !== 2) return false;
   const [expiresStr, sig] = parts;
   const expires = parseInt(expiresStr, 10);
   if (!expires || Date.now() > expires) return false;
-  const expected = await hmacSign(env.ADMIN_PASSWORD, expiresStr);
-  return expected === sig;
+  const expected = await hmacSign(sessionKey(env), expiresStr);
+  return safeEqualStr(expected, sig);
 }
 
 function bearerToken(request) {
@@ -142,13 +156,25 @@ export default {
     } catch {
       return json({ ok: false, error: 'Invalid JSON body' }, 400, cors);
     }
+    // Every route reads fields off the body, so it has to be a plain object (not null, a list or a number).
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return json({ ok: false, error: 'Invalid request' }, 400, cors);
+    }
 
     if (url.pathname === '/request-code') {
-      const { name, email, form_type, details, message } = body;
+      const name = oneLine(body.name, 80);
+      const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+      const form_type = oneLine(body.form_type, 60);
+      // free text that is only stored for the organisers, never put in the email to the person
+      const details = oneLine(body.details, 300);
+      const message = String(body.message == null ? '' : body.message).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim().slice(0, 1000);
       if (!name || !email || !form_type) {
         return json({ ok: false, error: 'Missing required fields' }, 400, cors);
       }
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      if (!LEGACY_FORM_TYPES.has(form_type)) {
+        return json({ ok: false, error: 'Unknown form' }, 400, cors);
+      }
+      if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         return json({ ok: false, error: 'Invalid email address' }, 400, cors);
       }
 
@@ -157,13 +183,13 @@ export default {
       if (!ipOk) {
         return json({ ok: false, error: 'Too many requests — please try again later' }, 429, cors);
       }
-      const emailOk = await checkRateLimit(env, `rl:email:${email.toLowerCase()}`, 3, 600);
+      const emailOk = await checkRateLimit(env, `rl:email:${email}`, 3, 600);
       if (!emailOk) {
         return json({ ok: false, error: 'Too many code requests for this email — please wait a few minutes and try again' }, 429, cors);
       }
 
-      const code = generateCode();
-      const key = `code:${email.toLowerCase()}`;
+      const code = secureCode();
+      const key = `code:${email}`;
       await env.CODES.put(
         key,
         JSON.stringify({ code, attempts: 0, name, email, form_type, details, message }),
@@ -194,12 +220,13 @@ export default {
     }
 
     if (url.pathname === '/verify-code') {
-      const { email, code } = body;
-      if (!email || !code) {
+      const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+      const code = body.code;
+      if (!email || !code || email.length > 254) {
         return json({ ok: false, error: 'Missing email or code' }, 400, cors);
       }
 
-      const key = `code:${email.toLowerCase()}`;
+      const key = `code:${email}`;
       const raw = await env.CODES.get(key);
       if (!raw) {
         return json({ ok: false, error: 'Code expired or not found — please request a new one' }, 404, cors);
@@ -212,7 +239,7 @@ export default {
         return json({ ok: false, error: 'Too many attempts — please request a new code' }, 429, cors);
       }
 
-      if (record.code !== String(code).trim()) {
+      if (!safeEqualStr(record.code, String(code).trim())) {
         record.attempts += 1;
         await env.CODES.put(key, JSON.stringify(record), { expirationTtl: 600 });
         return json({ ok: false, error: 'Incorrect code' }, 401, cors);
@@ -269,7 +296,7 @@ export default {
       }
 
       const { password } = body;
-      if (typeof password !== 'string' || password !== env.ADMIN_PASSWORD) {
+      if (typeof password !== 'string' || !env.ADMIN_PASSWORD || !safeEqualStr(password, env.ADMIN_PASSWORD)) {
         return json({ ok: false, error: 'Incorrect password' }, 401, cors);
       }
 

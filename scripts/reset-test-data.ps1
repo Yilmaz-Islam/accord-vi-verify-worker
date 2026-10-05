@@ -29,9 +29,16 @@ try {
   if ($Local) { $where = @('--local', '--config', 'wrangler.local.jsonc'); $label = 'LOCAL test database' }
   else        { $where = @('--remote'); $label = 'LIVE database' }
 
+  # Wrangler is run straight through Node, not through `npx`. Node's npx.ps1 shim re-reads the command text
+  # in its own scope when called from a script, so the variables below would arrive empty ("Cannot bind
+  # argument to parameter 'Path' because it is an empty string").
+  $Wrangler = Join-Path $Repo 'node_modules\wrangler\bin\wrangler.js'
+  if (-not (Test-Path $Wrangler)) { throw "Wrangler is not installed in $Repo. Run npm install there first." }
+  function Invoke-Wrangler { & node $Wrangler @args }
+
   $countSql = 'SELECT (SELECT COUNT(*) FROM users) AS accounts, (SELECT COUNT(*) FROM tickets) AS registrations, (SELECT COUNT(*) FROM attendee_tickets) AS qr_tickets, (SELECT COUNT(*) FROM receipt_history) AS earlier_receipts, (SELECT COUNT(*) FROM sessions) AS signed_in_devices;'
   function Show-Counts {
-    & npx --no-install wrangler d1 execute accord-accounts @where --yes --command $countSql
+    Invoke-Wrangler d1 execute accord-accounts @where --yes --command $countSql
     if ($LASTEXITCODE -ne 0) { throw 'Could not read the database (is wrangler logged in?)' }
   }
 
@@ -51,7 +58,7 @@ try {
   $answer = Read-Host "Type RESET (capitals) to erase everything in the $label, or press Enter to cancel"
   if ($answer -cne 'RESET') { Write-Output 'Cancelled. Nothing was changed.'; return }
 
-  & npx --no-install wrangler d1 execute accord-accounts @where --yes --file (Join-Path $PSScriptRoot 'reset-test-data.sql')
+  Invoke-Wrangler d1 execute accord-accounts @where --yes --file (Join-Path $PSScriptRoot 'reset-test-data.sql')
   if ($LASTEXITCODE -ne 0) { throw 'The reset did not finish. Run the script again.' }
 
   Write-Output ''
