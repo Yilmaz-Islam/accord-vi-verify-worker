@@ -236,7 +236,7 @@ const AVATAR_COLORS = ['#e0b455', '#e0555a', '#5fcf8f', '#6aa8ff', '#b184ff', '#
 
 // Date of the Terms and Privacy Policy text people agree to at sign-up. Bump it when either
 // page changes in a way that matters; the stored value shows which version each person accepted.
-const TERMS_VERSION = '2026-10-05';
+const TERMS_VERSION = '2026-10-23';
 
 const publicUser = (u) => ({
   email: u.email,
@@ -327,8 +327,8 @@ const siteUrl = (env) => (env.SITE_URL || 'https://yilmaz-islam.github.io/accord
 const rs = (n) => `Rs ${Number(n).toLocaleString('en-US')}`;
 
 const PASS_LABEL = {
-  concert: 'Live Concert only (18 October)',
-  both: 'Both nights: Live Concert (18 October) and Qawwali Night (19 October)',
+  concert: 'Live Concert only (21 November)',
+  both: 'Both nights: Live Concert (21 November) and Qawwali Night (22 November)',
   sponsor: 'Sponsorship interest',
 };
 const METHOD_LABEL = { jazzcash: 'JazzCash', bank: 'Bank transfer', cash: 'Cash, in person', none: '' };
@@ -354,17 +354,17 @@ export function emailHtml(env, message, buttons = []) {
     .map(
       (b) =>
         `<a href="${escapeHtml(b.url)}" style="display:inline-block;margin:0 10px 10px 0;padding:12px 22px;border-radius:999px;` +
-        `background:#e0b455;color:#0e0f12;font-weight:600;font-size:15px;text-decoration:none;">${escapeHtml(b.label)}</a>`
+        `background:#0f8f87;color:#0e0f12;font-weight:600;font-size:15px;text-decoration:none;">${escapeHtml(b.label)}</a>`
     )
     .join('');
   return (
     '<div style="background:#f4f2ee;padding:24px 12px;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;">' +
     '<div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e6e1d6;">' +
-    `<div style="background:#0e0f12;padding:18px 24px;color:#e0b455;font-size:20px;font-weight:700;letter-spacing:.02em;">${brand}</div>` +
+    `<div style="background:#0e0f12;padding:18px 24px;color:#0f8f87;font-size:20px;font-weight:700;letter-spacing:.02em;">${brand}</div>` +
     `<div style="padding:24px;color:#1b1c20;font-size:15px;line-height:1.6;">${body}` +
     (btns ? `<div style="margin-top:22px;">${btns}</div>` : '') +
     '</div>' +
-    '<div style="padding:14px 24px;background:#faf8f4;color:#7a7a85;font-size:12px;">18–19 October · Beaconhouse Cantt Campus, Multan</div>' +
+    '<div style="padding:14px 24px;background:#faf8f4;color:#7a7a85;font-size:12px;">21–22 November · Beaconhouse Cantt Campus, Multan</div>' +
     '</div></div>'
   );
 }
@@ -455,7 +455,7 @@ function confirmedEmailBase(env, user, t) {
   if (t.persona === 'group') lines.push(`Group size: ${t.attendeeCount}`);
   lines.push(
     '',
-    'See you at Beaconhouse Cantt Campus, Multan, on 18 and 19 October.',
+    'See you at Beaconhouse Cantt Campus, Multan, on 21 and 22 November.',
     '',
     `You can see your registration any time at ${siteUrl(env)}/account.html`,
     '',
