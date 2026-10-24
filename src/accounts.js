@@ -236,7 +236,7 @@ const AVATAR_COLORS = ['#e0b455', '#e0555a', '#5fcf8f', '#6aa8ff', '#b184ff', '#
 
 // Date of the Terms and Privacy Policy text people agree to at sign-up. Bump it when either
 // page changes in a way that matters; the stored value shows which version each person accepted.
-const TERMS_VERSION = '2026-10-23';
+const TERMS_VERSION = '2026-10-24';
 
 const publicUser = (u) => ({
   email: u.email,
@@ -322,7 +322,7 @@ function validateTicket(b) {
 // recipient {{email}}. The old code params are sent too, so the template keeps
 // working until it is switched over. See ACCOUNTS.md.
 
-const siteName = (env) => env.SITE_NAME || 'Accord VI';
+const siteName = (env) => env.SITE_NAME || 'Accord 6.0';
 const siteUrl = (env) => (env.SITE_URL || 'https://yilmaz-islam.github.io/accord-vi').replace(/\/$/, '');
 const rs = (n) => `Rs ${Number(n).toLocaleString('en-US')}`;
 
@@ -364,7 +364,7 @@ export function emailHtml(env, message, buttons = []) {
     `<div style="padding:24px;color:#1b1c20;font-size:15px;line-height:1.6;">${body}` +
     (btns ? `<div style="margin-top:22px;">${btns}</div>` : '') +
     '</div>' +
-    '<div style="padding:14px 24px;background:#faf8f4;color:#7a7a85;font-size:12px;">21–22 November · Beaconhouse Cantt Campus, Multan</div>' +
+    '<div style="padding:14px 24px;background:#faf8f4;color:#7a7a85;font-size:12px;">21–22 November · Beaconhouse Cantt Campus, Askari Bypass Road, Multan</div>' +
     '</div></div>'
   );
 }
@@ -455,7 +455,7 @@ function confirmedEmailBase(env, user, t) {
   if (t.persona === 'group') lines.push(`Group size: ${t.attendeeCount}`);
   lines.push(
     '',
-    'See you at Beaconhouse Cantt Campus, Multan, on 21 and 22 November.',
+    'See you at Beaconhouse Cantt Campus, Askari Bypass Road, Multan, on 21 and 22 November.',
     '',
     `You can see your registration any time at ${siteUrl(env)}/account.html`,
     '',
@@ -614,6 +614,68 @@ async function notifyOrganisers(ctx, user, t) {
     return;
   }
   await sendEmail(env, env.EMAILJS_NOTIFY_TEMPLATE_ID, params);
+}
+
+// ---------- the organisers' morning summary ----------
+// Runs once a day from the cron trigger in wrangler.jsonc (09:00 Pakistan time).
+// One email lists the tickets submitted in the last 24 hours and how many are
+// still waiting for their payment to be checked. Nothing new and nothing waiting
+// means no email.
+export async function sendDailySummary(env, sendEmail, now = new Date()) {
+  const since = new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
+  const fresh = await env.DB.prepare(
+    `SELECT u.name, u.email, t.persona, t.pass, t.amount_pkr AS amountPkr, t.pay_method AS payMethod,
+            t.attendee_count AS attendeeCount, t.status, t.receipt IS NOT NULL AS hasReceipt
+       FROM tickets t JOIN users u ON u.id = t.user_id
+      WHERE t.submitted_at >= ? AND t.status != 'interest'
+      ORDER BY t.submitted_at`
+  ).bind(since).all();
+  const totals = await env.DB.prepare(
+    `SELECT
+       SUM(status = 'pending') AS pending,
+       SUM(status = 'confirmed') AS confirmed,
+       COALESCE(SUM(CASE WHEN status = 'confirmed' THEN attendee_count END), 0) AS people,
+       COALESCE(SUM(CASE WHEN status = 'confirmed' THEN amount_pkr END), 0) AS takings
+     FROM tickets WHERE status != 'interest'`
+  ).first();
+  const rows = fresh.results || [];
+  const pending = Number(totals?.pending || 0);
+  if (!rows.length && !pending) return { sent: false };
+
+  const name = siteName(env);
+  const lines = [
+    `${rows.length} new registration${rows.length === 1 ? '' : 's'} in the last 24 hours.`,
+    '',
+    ...rows.map((r) =>
+      [
+        `• ${r.name} (${r.email})`,
+        r.persona === 'group' ? `group of ${r.attendeeCount}` : r.persona,
+        PASS_LABEL[r.pass] || r.pass,
+        rs(r.amountPkr),
+        METHOD_LABEL[r.payMethod] || 'n/a',
+        r.hasReceipt ? 'receipt attached' : '',
+        r.status === 'confirmed' ? 'already confirmed' : '',
+      ].filter(Boolean).join(', ')
+    ),
+    rows.length ? '' : null,
+    `Waiting for a payment check: ${pending}`,
+    `Confirmed so far: ${Number(totals?.confirmed || 0)} registrations, ${Number(totals?.people || 0)} people, ${rs(totals?.takings || 0)}`,
+    '',
+    `Confirm payments in the admin panel: ${siteUrl(env)}/admin.html`,
+  ].filter((l) => l !== null);
+  const params = {
+    name: `${name} daily summary`,
+    email: env.ORGANISER_EMAIL || 'accordbccmvi@gmail.com',
+    form_type: `Daily summary: ${rows.length} new, ${pending} waiting`,
+    details: `New: ${rows.length} | Waiting for a payment check: ${pending}`,
+    message: lines.join('\n'),
+  };
+  if (env.DEV_MODE === '1') {
+    await devOutbox(env, { kind: 'summary', ...params });
+  } else {
+    await sendEmail(env, env.EMAILJS_NOTIFY_TEMPLATE_ID, params);
+  }
+  return { sent: true, fresh: rows.length, pending };
 }
 
 // ---------- attendee tickets: signed QR codes ----------
@@ -920,6 +982,7 @@ export async function handleAccount(ctx) {
     if (body.acceptTerms !== true) {
       return fail('You need to accept the Terms and the Privacy Policy to create an account', 400);
     }
+    if (!(await ctx.humanCheck(body.turnstileToken, ip))) return fail(ctx.humanCheckError, 400);
 
     if (!(await checkRateLimit(env, `rl:acct-signup-ip:${ip}`, 10, 3600))) {
       return fail('Too many attempts. Please try again later', 429);
@@ -1390,7 +1453,7 @@ export async function handleAccount(ctx) {
             t.pass, t.amountPkr, t.payMethod, t.receipt, t.status, now)
       .run();
 
-    // The two emails are best-effort: the ticket is saved either way, and the
+    // The emails are best-effort: the ticket is saved either way, and the
     // admin panel shows it whether or not these send.
     const warnings = [];
     try {
@@ -1400,10 +1463,15 @@ export async function handleAccount(ctx) {
       console.log('sendEmail (pending) failed:', err.message);
       warnings.push('confirmation-email');
     }
-    try {
-      await notifyOrganisers(ctx, me, t);
-    } catch (err) {
-      console.log('notify organisers failed:', err.message);
+    // Sponsors are rare and worth a quick reply, so they still reach the organisers
+    // straight away. Tickets are rolled into the morning summary (sendDailySummary)
+    // to save emails: the EmailJS plan has a monthly limit.
+    if (t.status === 'interest') {
+      try {
+        await notifyOrganisers(ctx, me, t);
+      } catch (err) {
+        console.log('notify organisers failed:', err.message);
+      }
     }
 
     return ok({

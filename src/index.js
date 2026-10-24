@@ -14,7 +14,7 @@
 // (EmailJS's free plan caps templates at 2, and the organizer-notification
 // template already uses one of them).
 
-import { handleAccount, handleAdminTickets, handleGate, emailHtml, secureCode, safeEqualStr } from './accounts.js';
+import { handleAccount, handleAdminTickets, handleGate, emailHtml, secureCode, safeEqualStr, sendDailySummary } from './accounts.js';
 
 function corsHeaders(origin, env) {
   const allowed = env.ALLOWED_ORIGINS.split(',').map((s) => s.trim());
@@ -78,6 +78,29 @@ async function sendEmail(env, templateId, params) {
     throw new Error(`EmailJS send failed (${res.status}): ${text}`);
   }
 }
+
+// Cloudflare Turnstile, the "are you human" check on the two forms that email a
+// stranger (sign-up and the sponsor form). Without it a bot could burn through
+// the monthly EmailJS allowance in minutes. Switched on by setting the
+// TURNSTILE_SECRET secret; until then every request passes, so the site and the
+// worker can be updated in either order.
+async function passesHumanCheck(env, token, ip) {
+  if (!env.TURNSTILE_SECRET) return true;
+  if (typeof token !== 'string' || !token || token.length > 2048) return false;
+  const form = new FormData();
+  form.append('secret', env.TURNSTILE_SECRET);
+  form.append('response', token);
+  if (ip && ip !== 'unknown') form.append('remoteip', ip);
+  try {
+    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: form });
+    const data = await res.json();
+    return data.success === true;
+  } catch (err) {
+    console.log('Turnstile check failed:', err.message);
+    return false;
+  }
+}
+const HUMAN_CHECK_ERROR = 'Please complete the "I\'m human" check and try again';
 
 // ---------- Admin session: a signed, expiring bearer token ----------
 // No session store — the token itself carries an expiry plus an HMAC
@@ -179,6 +202,9 @@ export default {
       }
 
       const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+      if (!(await passesHumanCheck(env, body.turnstileToken, ip))) {
+        return json({ ok: false, error: HUMAN_CHECK_ERROR }, 400, cors);
+      }
       const ipOk = await checkRateLimit(env, `rl:ip:${ip}`, 10, 3600);
       if (!ipOk) {
         return json({ ok: false, error: 'Too many requests — please try again later' }, 429, cors);
@@ -200,14 +226,14 @@ export default {
         // `subject` and `message` feed the shared one-template setup (see
         // ACCOUNTS.md); `form_type` and `code` keep the older template working.
         const codeMessage =
-          `Hi ${name},\n\nYour ${env.SITE_NAME || 'Accord VI'} code for "${form_type}" is ${code}. ` +
+          `Hi ${name},\n\nYour ${env.SITE_NAME || 'Accord 6.0'} code for "${form_type}" is ${code}. ` +
           'It expires in 10 minutes. If you did not ask for this, you can ignore this email.';
         await sendEmail(env, env.EMAILJS_CODE_TEMPLATE_ID, {
           name,
           email,
           form_type,
           code,
-          subject: `${env.SITE_NAME || 'Accord VI'}: your verification code`,
+          subject: `${env.SITE_NAME || 'Accord 6.0'}: your verification code`,
           message: codeMessage,
           html: emailHtml(env, codeMessage),
         });
@@ -329,7 +355,8 @@ export default {
 
     // ---------- User accounts and tickets (see accounts.js) ----------
     if (url.pathname.startsWith('/account/')) {
-      return handleAccount({ request, env, url, body, cors, json, checkRateLimit, sendEmail });
+      const humanCheck = (token, ip) => passesHumanCheck(env, token, ip);
+      return handleAccount({ request, env, url, body, cors, json, checkRateLimit, sendEmail, humanCheck, humanCheckError: HUMAN_CHECK_ERROR });
     }
     if (['/admin/tickets', '/admin/ticket-receipt', '/admin/ticket-history', '/admin/ticket-confirm'].includes(url.pathname)) {
       const isAdmin = (req) => verifySessionToken(env, bearerToken(req));
@@ -348,5 +375,12 @@ export default {
     }
 
     return json({ ok: false, error: 'Not found' }, 404, cors);
+  },
+
+  // The cron trigger in wrangler.jsonc: the organisers' morning summary.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      sendDailySummary(env, sendEmail).catch((err) => console.log('daily summary failed:', err.message))
+    );
   },
 };

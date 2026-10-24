@@ -13,8 +13,9 @@ Code is in `src/accounts.js`, the database in `schema.sql`.
    Signing up then emails a 6-digit code once; after that the register wizard already knows the name and email.
 3. The wizard collects who they are, the pass (Concert only Rs 2,500, Both nights Rs 3,500, times the group size),
    and how they pay. JazzCash and bank transfer need a clear receipt photo. Cash does not. Sponsors register interest only.
-4. Submitting saves a **pending** registration and sends a "pending payment verification" email to the person and a notice
-   to the organisers. **One registration per account**: they can replace a pending one (for example to upload a clearer
+4. Submitting saves a **pending** registration and sends a "pending payment verification" email to the person. The organisers
+   get one **morning summary** (09:00 Pakistan time, cron in `wrangler.jsonc`) listing the last 24 hours and how many
+   are waiting; sponsor interest still reaches them straight away. **One registration per account**: they can replace a pending one (for example to upload a clearer
    receipt) but every replaced receipt is archived in `receipt_history`, so nothing is lost. A confirmed one is locked.
 5. An admin opens the Tickets tab, views the receipt next to the name, email and amount (and any earlier receipts), and
    presses **Payment confirmed**. That marks it confirmed, **creates one ticket per person**, and emails the buyer a
@@ -41,8 +42,11 @@ npx wrangler d1 execute accord-accounts --local --config wrangler.local.jsonc --
 npx wrangler dev --config wrangler.local.jsonc --port 8787
 node test-accounts.mjs      # 40 checks: sign-up, terms acceptance, login, sessions, reset, delete, deletion email
 node test-tickets.mjs       # 29 checks: pricing, receipts, admin review, confirmation, email safety
-node test-gate.mjs          # 44 checks: tickets, forged codes, gate access, one-time admit, receipt history
+node test-gate.mjs          # 55 checks: tickets, forged codes, gate access, one-time admit, receipt history
 node test-settings.mjs      # 66 checks: devices, password and email change, alerts, avatar, data download
+node test-security.mjs      # 76 checks: forged tokens, tampering, enumeration, bad bodies, CORS
+node test-summary.mjs       # 9 checks: morning summary, sponsor notice (start wrangler dev with --test-scheduled)
+node test-humancheck.mjs    # 5 checks: "are you human" check (start wrangler dev with --var TURNSTILE_SECRET:<test secret>, see the file)
 ```
 
 A database created before the account centre needs the one-time upgrades in `migrations/` (`002-account-settings.sql`, then
@@ -103,6 +107,7 @@ Optional `vars`: `SITE_NAME` (default "Accord VI") and `SITE_URL` (default `http
 | `TICKET_SECRET` | signs the QR tickets | every issued ticket stops being valid |
 | `GATE_PASSWORD` | door staff sign-in | harmless: set a new one |
 | `ADMIN_PASSWORD` | admin sign-in | harmless: set a new one |
+| `TURNSTILE_SECRET` | the "are you human" check on sign-up and the sponsor form (Cloudflare Turnstile). Not set = check off | harmless: make a new widget key |
 
 Keep a copy of `PEPPER` and `TICKET_SECRET` somewhere safe. Never commit any of them.
 
@@ -151,3 +156,15 @@ is the only way back. Never run it once real people have registered and paid.
 - Tokens live in `localStorage`. Robust to third-party-cookie blocking, but any XSS bug on the site could steal one.
 - Receipts are personal financial documents. They are returned only to the admin token.
 - HTML emails escape everything a person typed (for example a name), and button links are fixed by the server.
+
+## The "are you human" check (Cloudflare Turnstile)
+
+Sign-up (`/account/signup/request`, including "Send the code again") and the sponsor form (`/request-code`) need a
+Turnstile token when `TURNSTILE_SECRET` is set. It stops bots from using up the monthly EmailJS allowance. Switching it on:
+
+1. Cloudflare dashboard > Turnstile > Add widget: hostname `yilmaz-islam.github.io`, mode Managed.
+2. Put the **site key** (public) in the site's `js/human-check.js` (`SITE_KEY`) and push the site.
+3. `node node_modules\wrangler\bin\wrangler.js secret put TURNSTILE_SECRET` and paste the **secret key**. Then deploy.
+
+Do step 2 before step 3: a worker with the secret refuses sign-ups from a page that has no site key.
+Locally the page always uses Cloudflare's public test key, so `localhost` never needs the real one.

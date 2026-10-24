@@ -85,7 +85,7 @@ check(
 let o = await call('/dev/outbox', {});
 const pendingMail = o.data.outbox.filter((m) => m.kind === 'user' && m.to === buyer.email && /pending verification/i.test(m.subject));
 check('the pending-payment email was sent to the buyer', pendingMail.length >= 1 && /Rs 3,500/.test(pendingMail.at(-1).message), pendingMail.at(-1));
-check('the organisers were notified of the new ticket', o.data.outbox.some((m) => m.kind === 'organiser' && m.email === buyer.email));
+check('the organisers are not emailed per ticket (it goes in the morning summary)', !o.data.outbox.some((m) => m.kind === 'organiser' && m.email === buyer.email));
 
 const lastPending = pendingMail.at(-1) || {};
 check(

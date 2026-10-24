@@ -3,6 +3,8 @@
   "main": "src/index.js",
   "compatibility_date": "2026-09-01",
   "account_id": "c77367b0fe0a65a2cc7ba7a2f26bde0f",
+  // The organisers' morning summary email: 04:00 UTC is 09:00 in Pakistan.
+  "triggers": { "crons": ["0 4 * * *"] },
   "kv_namespaces": [
     {
       "binding": "CODES",
